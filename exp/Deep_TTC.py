@@ -55,6 +55,9 @@ class Exp(BaseExp):
         self.grid_size = 50
         # grid sampling padding mode
         self.grid_sample_padding = 'zeros'
+        # multi-scale feature fusion inside backbone
+        self.use_backbone_multiscale_fusion = True
+        self.multiscale_pool_kernel_sizes = (5, 9, 13)
 
         # ---------------- dataloader config ---------------- #
         # set worker to 8 for shorter dataloader init time
@@ -149,7 +152,14 @@ class Exp(BaseExp):
         from model.ttc_head import TTCHead
         from model.TTCNet import TTCNet
 
-        backbone = TTCBase(dep_mul=self.depth, wid_mul=self.width, kszie=self.ksize_base, act=self.act)
+        backbone = TTCBase(
+            dep_mul=self.depth,
+            wid_mul=self.width,
+            kszie=self.ksize_base,
+            act=self.act,
+            use_multiscale_fusion=self.use_backbone_multiscale_fusion,
+            multiscale_pool_kernel_sizes=self.multiscale_pool_kernel_sizes,
+        )
         head = TTCHead(scale_number=self.scale_num, width=self.width,
                        fps=10 / (self.sequence_len - 1), ttc_bin=self.ttc_bin, min_scale=self.min_scale,
                        max_scale=self.max_scale, distance_type=self.distance_type, shift=self.shift,
@@ -322,7 +332,12 @@ class Exp(BaseExp):
                 src_type = type(src_value)
                 if src_value is not None and src_type != type(v):
                     try:
-                        v = src_type(v)
+                        if src_type is bool:
+                            v = v.lower() in ("true", "1", "yes", "y")
+                        elif src_type in (list, tuple, dict):
+                            v = ast.literal_eval(v)
+                        else:
+                            v = src_type(v)
                     except Exception:
                         v = ast.literal_eval(v)
                 setattr(self, k, v)

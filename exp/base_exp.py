@@ -71,7 +71,12 @@ class BaseExp(metaclass=ABCMeta):
                 src_type = type(src_value)
                 if src_value is not None and src_type != type(v):
                     try:
-                        v = src_type(v)
+                        if src_type is bool:
+                            v = v.lower() in ("true", "1", "yes", "y")
+                        elif src_type in (list, tuple, dict):
+                            v = ast.literal_eval(v)
+                        else:
+                            v = src_type(v)
                     except Exception:
                         v = ast.literal_eval(v)
                 setattr(self, k, v)

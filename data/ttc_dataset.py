@@ -90,7 +90,7 @@ class TSTTCDataset(torchDataset):
         self.seq_len = seq_len
         logger.info("Loading TSTTC dataset from {}...".format(self.data_path))
         self.tsttc = TSTTC(self.data_path, self.anno_path,
-                           sequence_len=6)
+                           sequence_len=seq_len)
         self.whole_img = whole_img
         self.box_downsample_thresh = box_downsample_thresh
         self.min_size_after_padding = min_size_after_padding

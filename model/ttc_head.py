@@ -122,7 +122,10 @@ class TTCHead(nn.Module):
         else:
             scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / gap) for ttc in gts]
         scale_number,gt_number,range_list = self.scale_number,len(gts),scale_list
-        range_tensor = torch.tensor(range_list).view([-1, scale_number])
+        if torch.is_tensor(range_list):
+            range_tensor = range_list.detach().clone().view([-1, scale_number])
+        else:
+            range_tensor = torch.tensor(range_list).view([-1, scale_number])
         range_tensor = range_tensor.repeat(gt_number, 1)
         gts_tensor = torch.tensor(scale_gt).view(gt_number, -1).repeat([1, scale_number]).type_as(range_tensor)
 
@@ -171,8 +174,8 @@ class TTCHead(nn.Module):
             return align_boxes
 
         batch_index = tar_boxes[:,:1]
-        tar_boxes = tar_boxes[:,1:]
-        ref_boxes = ref_boxes[:,1:]
+        tar_boxes = tar_boxes[:,1:].clone()
+        ref_boxes = ref_boxes[:,1:].clone()
         if self.normed_box:
             tar_boxes[:,::2] = tar_boxes[:,::2]*W
             tar_boxes[:,1::2] = tar_boxes[:,1::2]*H
@@ -183,4 +186,3 @@ class TTCHead(nn.Module):
         ref_align_boxes = torch.cat([batch_index.repeat([1,self.scale_number]).view([-1,1]),scaled_ref_boxes],dim=-1)
         tar_align_boxes = torch.cat([batch_index.repeat([1,1]),scaled_tar_boxes],dim=-1)
         return ref_align_boxes,tar_align_boxes
-

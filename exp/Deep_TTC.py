@@ -22,6 +22,7 @@ class Exp(BaseExp):
     def __init__(self):
         super().__init__()
         self.archi_name = 'TTCBase'
+        self.head_type = 'distribution'
         # ---------------- model config ---------------- #
         # random seed
         self.seed = 0
@@ -32,7 +33,7 @@ class Exp(BaseExp):
         # activation name. For example, if using "relu", then "silu" will be replaced to "relu".
         self.act = "silu"
         # scale number
-        self.scale_num = 20
+        self.scale_num = 50
         # ttc bin or scale bin
         self.ttc_bin = False
         # min max ratio list for different frame gap (corresponding 1.0 and -1.5)
@@ -58,6 +59,15 @@ class Exp(BaseExp):
         # multi-scale feature fusion inside backbone
         self.use_backbone_multiscale_fusion = True
         self.multiscale_pool_kernel_sizes = (5, 9, 13)
+        self.use_ms_detail_branch = True
+        self.use_ms_context_branches = True
+        self.use_ms_global_branch = True
+        self.use_ms_channel_gate = True
+        self.use_ms_spatial_gate = True
+        # similarity aggregation in TTCHead: global shape + local details
+        self.normalize_similarity = False
+        self.similarity_topk_ratio = 0.05
+        self.similarity_topk_weight = 0.0
 
         # ---------------- dataloader config ---------------- #
         # set worker to 8 for shorter dataloader init time
@@ -78,7 +88,7 @@ class Exp(BaseExp):
         # downsample by 2x if the box size is larger than this value |box level only|
         self.box_downsample_thresh = 300  # [300,300]
         # padding img size when cropping
-        self.receptive_filed = 16
+        self.receptive_filed = 32
         # use NeRF data or not
         self.use_nerf = False
         # use resample for ttc 0~6 same lane or not
@@ -99,10 +109,13 @@ class Exp(BaseExp):
         self.normed_box = True
         # trainset ratio of totoal dataset
         self.training_data_ratio = 1.0
+        self.val_data_ratio = 1.0
+        # 0 keeps the original behavior: val batch size follows train batch size.
+        self.eval_batch_size = 0
         # --------------- transform config ----------------- #
 
         # prob of applying hsv aug
-        self.hsv_prob = 1.0
+        self.hsv_prob = 0.5
         # enlarge the cur object image
         self.dynamic_ratio_aug = 1.0
         # prob of applying reverse aug
@@ -112,18 +125,18 @@ class Exp(BaseExp):
 
         # --------------  training config --------------------- #
         # epoch number used for warmup
-        self.warmup_epochs = 1
+        self.warmup_epochs = 3
         # max training epoch
         self.max_epoch = 36
         # minimum learning rate during warmup
         self.warmup_lr = 0
         self.min_lr_ratio = 0.01
         # learning rate for one image. During training, lr will multiply batchsize.
-        self.basic_lr_per_img = 0.0001 / 2
+        self.basic_lr_per_img = 5e-4
         # name of LRScheduler
         self.scheduler = "yoloxwarmcos"
         # last #epoch to close augmention like mosaic
-        self.no_aug_epochs = 4
+        self.no_aug_epochs = 8
         # apply EMA during training
         self.ema = False
 
@@ -159,12 +172,21 @@ class Exp(BaseExp):
             act=self.act,
             use_multiscale_fusion=self.use_backbone_multiscale_fusion,
             multiscale_pool_kernel_sizes=self.multiscale_pool_kernel_sizes,
+            use_ms_detail_branch=self.use_ms_detail_branch,
+            use_ms_context_branches=self.use_ms_context_branches,
+            use_ms_global_branch=self.use_ms_global_branch,
+            use_ms_channel_gate=self.use_ms_channel_gate,
+            use_ms_spatial_gate=self.use_ms_spatial_gate,
         )
         head = TTCHead(scale_number=self.scale_num, width=self.width,
                        fps=10 / (self.sequence_len - 1), ttc_bin=self.ttc_bin, min_scale=self.min_scale,
                        max_scale=self.max_scale, distance_type=self.distance_type, shift=self.shift,
                        shift_kernel_size=self.shift_size, grid_size=self.grid_size, normed_box=self.normed_box,
-                       sequence_len=self.sequence_len)
+                       sequence_len=self.sequence_len,
+                       head_type=self.head_type,
+                       normalize_similarity=self.normalize_similarity,
+                       similarity_topk_ratio=self.similarity_topk_ratio,
+                       similarity_topk_weight=self.similarity_topk_weight)
 
         def init_model(M):
             for m in M.modules():
@@ -251,10 +273,30 @@ class Exp(BaseExp):
         )
         return scheduler
 
+    def _check_dataset_path(self, path, name):
+        if path is None:
+            raise ValueError(
+                "{} is not set. Pass it as an Exp opt, for example: {} /home/zzqh/TTC/Datasets/train".format(
+                    name, name
+                )
+            )
+        if not os.path.isdir(path):
+            raise FileNotFoundError("{} does not exist: {}".format(name, path))
+
+    def _check_non_empty_dataset(self, dataset, split_name):
+        if len(dataset) == 0:
+            raise ValueError(
+                "{} dataset is empty. Check the dataset dir, annotation path, and sequence_len={}".format(
+                    split_name, self.sequence_len
+                )
+            )
+
     def get_eval_loader(self, batch_size, is_distributed, testdev=False, legacy=False,
                         data_path=None, anno_path=None):
-        assert data_path is not None
-        assert anno_path is not None
+        self._check_dataset_path(data_path, "valset_dir")
+        self._check_dataset_path(anno_path, "valAnnoPath")
+        if self.eval_batch_size > 0:
+            batch_size = self.eval_batch_size
         #data_path = data_path if data_path != '' else self.valset_dir
         # TODO: fix max_boxSize param
         valArgs = {
@@ -263,11 +305,13 @@ class Exp(BaseExp):
             'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
             'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
             'default_max_scale':self.max_scale,
-            'grid_size':self.grid_size
+            'grid_size':self.grid_size,
+            'training_data_ratio': self.val_data_ratio
         }
         if self.box_level:
             valArgs['preproc'] = None
         valdataset = TSTTCDataset(**valArgs)
+        self._check_non_empty_dataset(valdataset, "val")
         if is_distributed:
             batch_size = batch_size // dist.get_world_size()
         dataset = get_ttc_loader(batch_size, data_num_workers=self.data_num_workers,
@@ -292,6 +336,8 @@ class Exp(BaseExp):
     def get_data_loader(self, batch_size, is_distributed):
         from core.auxil import wait_for_the_master
         with wait_for_the_master():
+            self._check_dataset_path(self.trainset_dir, "trainset_dir")
+            self._check_dataset_path(self.trainAnnoPath, "trainAnnoPath")
             trainArgs = {
                 'data_path': self.trainset_dir, 'anno_path': self.trainAnnoPath, 'img_size': self.test_size,
                 'preproc': TrainTransform(hsv_prob=self.hsv_prob),
@@ -299,7 +345,8 @@ class Exp(BaseExp):
                 'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
                 'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
                 'default_max_scale': self.max_scale,
-                'grid_size': self.grid_size
+                'grid_size': self.grid_size,
+                'training_data_ratio': self.training_data_ratio
             }
             if self.box_level:
                 trainArgs['preproc'] = TrainTransformSeqLevel(hsv_prob=self.hsv_prob)
@@ -308,6 +355,7 @@ class Exp(BaseExp):
                 trainArgs['nerf_seqs'] = self.nerf_seqs
                 trainArgs['nerf_seed'] = self.nerf_seed
             dataset = TSTTCDataset(**trainArgs)
+            self._check_non_empty_dataset(dataset, "train")
             if is_distributed:
                 batch_size = batch_size // dist.get_world_size()
         ttc_train_loader = get_ttc_loader(batch_size, data_num_workers=self.data_num_workers, dataset=dataset,

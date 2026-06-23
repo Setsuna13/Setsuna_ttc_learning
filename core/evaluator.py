@@ -49,31 +49,46 @@ class TTCEvaluator:
                 if is_time_record:
                     start = time.time()
 
-                outputs, scale_list, _ = model.forward(imgs, candidate_boxes, annos)
+                outputs, scale_list, pred_scales = model.forward(imgs, candidate_boxes, annos)
 
                 if is_time_record:
                     infer_end = time_synchronized()
                     inference_time += infer_end - start
 
                 outputs = outputs.reshape(-1, self.scale_number)
-                pred_conf, pred_bin = torch.topk(outputs,k=topk,dim=-1)
-                pred_conf, pred_bin = pred_conf.cpu(), pred_bin.cpu()
-                pred_conf = pred_conf / torch.sum(pred_conf,dim=-1,keepdim=True)
-                scale_list = torch.tensor(scale_list)
-                pred_scales =  torch.tensor(torch.sum(scale_list[pred_bin] * pred_conf,dim=-1))
+                scale_list = torch.as_tensor(scale_list, dtype=outputs.dtype, device=outputs.device)
+                if pred_scales is None:
+                    row_sums = outputs.sum(dim=-1, keepdim=True)
+                    is_distribution = torch.allclose(
+                        row_sums, torch.ones_like(row_sums), rtol=1e-3, atol=1e-3
+                    )
+                    if is_distribution:
+                        pred_scales = torch.sum(outputs * scale_list, dim=-1)
+                    else:
+                        pred_conf, pred_bin = torch.topk(outputs, k=topk, dim=-1)
+                        pred_conf = pred_conf / torch.clamp(pred_conf.sum(dim=-1, keepdim=True), min=1e-12)
+                        pred_scales = torch.sum(scale_list[pred_bin] * pred_conf, dim=-1)
+                else:
+                    pred_scales = pred_scales.reshape(-1).type_as(outputs)
 
                 pred_ttcs = scale_ratio_to_ttc(pred_scales,self.fps)
-                pred_ttc_list = pred_ttcs.cpu().numpy().tolist()
-                ttc_gt = torch.tensor(ttc_gts_tensor).view(-1, 1).flatten()
-                scale_gt = torch.tensor([ttc_to_scale_ratio(ttc_gt[i], self.fps) for i in range(ttc_gt.shape[0])])
-                ave_ttc_errors, tmp_ttc, ttcs_abs_error = self.compute_error_rate(pred_ttcs, ttc_gt,mid=False)
-                ave_scale_errors, tmp_scale, scale_abs_error = self.compute_error_rate(pred_ttcs, ttc_gt,mid=True)
+                if isinstance(ttc_gts_tensor, torch.Tensor):
+                    ttc_gt = ttc_gts_tensor.detach().to(device=pred_ttcs.device, dtype=pred_ttcs.dtype).view(-1)
+                else:
+                    ttc_gt = torch.as_tensor(ttc_gts_tensor, dtype=pred_ttcs.dtype, device=pred_ttcs.device).view(-1)
+
+                pred_ttcs_eval = pred_ttcs.detach().float().cpu()
+                ttc_gt_eval = ttc_gt.detach().float().cpu()
+                scale_gt = ttc_to_scale_ratio(ttc_gt_eval, self.fps)
+                pred_ttc_list = pred_ttcs_eval.numpy().tolist()
+                ave_ttc_errors, tmp_ttc, ttcs_abs_error = self.compute_error_rate(pred_ttcs_eval, ttc_gt_eval,mid=False)
+                ave_scale_errors, tmp_scale, scale_abs_error = self.compute_error_rate(pred_ttcs_eval, ttc_gt_eval,mid=True)
 
                 for box_id, contents in enumerate(zip(annos['metaAnnos'], tmp_ttc, tmp_scale, ttcs_abs_error, scale_abs_error,pred_ttc_list)):
                     raw_obj, ttc_rel, scale_rel, ttc_abs, scale_abs,pred_ttc = contents
                     result_dict[raw_obj.anno_id] = pred_ttc
                     analysis_list.append(np.array(
-                        [ttc_rel, ttc_abs, scale_rel, scale_abs, float(ttc_gt[box_id]), float(scale_gt[box_id])]
+                        [ttc_rel, ttc_abs, scale_rel, scale_abs, float(ttc_gt_eval[box_id]), float(scale_gt[box_id])]
                     ))
                 ttc_error_list.extend(tmp_ttc)
                 scale_error_list.extend(tmp_scale)
@@ -95,19 +110,28 @@ class TTCEvaluator:
 
 
     def compute_error_rate(self, pred, gt, mid = False):
+        if torch.is_tensor(pred):
+            pred = pred.detach().cpu()
+        else:
+            pred = torch.as_tensor(pred)
+        if torch.is_tensor(gt):
+            gt = gt.detach().cpu()
+        else:
+            gt = torch.as_tensor(gt)
         assert pred.shape[0] == gt.shape[0]
         relative_errors, abs_error = [], []
 
         for i in range(pred.shape[0]):
             if mid:
                 pred_ttc = max(min(pred[i], 20), -20)
-                pred_tmp = ttc_to_scale_ratio(pred_ttc)
-                gt_tmp = ttc_to_scale_ratio(gt[i])
+                pred_tmp = ttc_to_scale_ratio(pred_ttc, self.fps)
+                gt_tmp = ttc_to_scale_ratio(gt[i], self.fps)
                 error = float(abs(math.log(pred_tmp) - math.log(gt_tmp)) * 10**4)
             else:
                 pred_tmp = max(min(pred[i], 20), -20)
-                gt_tmp = gt[i]
-                error = float(abs((pred_tmp - gt_tmp) / abs(gt_tmp)) * 100)
+                gt_tmp = max(min(gt[i], 20), -20)
+                div = abs(gt_tmp) if abs(gt_tmp) > 1e-4 else 1e-4
+                error = float(abs((pred_tmp - gt_tmp) / div) * 100)
             abs_error.append(abs(pred_tmp - gt_tmp))
             relative_errors.append(error)
         return sum(relative_errors) / len(relative_errors), relative_errors, abs_error

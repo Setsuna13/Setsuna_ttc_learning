@@ -7,8 +7,24 @@ from .network_blocks import BaseConv, CSPLayer, DWConv, get_activation
 class MultiScaleFeatureFusion(nn.Module):
     """Fuse local detail, object-level context, and global context features."""
 
-    def __init__(self, channels, act="silu", pool_kernel_sizes=(5, 9, 13)):
+    def __init__(
+            self,
+            channels,
+            act="silu",
+            pool_kernel_sizes=(5, 9, 13),
+            use_detail_branch=True,
+            use_context_branches=True,
+            use_global_branch=True,
+            use_channel_gate=True,
+            use_spatial_gate=True,
+    ):
         super().__init__()
+        self.use_detail_branch = use_detail_branch
+        self.use_context_branches = use_context_branches
+        self.use_global_branch = use_global_branch
+        self.use_channel_gate = use_channel_gate
+        self.use_spatial_gate = use_spatial_gate
+
         hidden_channels = max(channels // 2, 1)
         self.reduce = BaseConv(channels, hidden_channels, 1, 1, act=act)
 
@@ -48,19 +64,84 @@ class MultiScaleFeatureFusion(nn.Module):
     def forward(self, x):
         y = self.reduce(x)
         h, w = y.shape[-2:]
+        zero_branch = torch.zeros_like(y)
 
-        detail = self.detail_branch(y)
-        contexts = [branch(y) for branch in self.context_branches]
-        global_context = F.interpolate(
-            self.global_branch(y),
-            size=(h, w),
+        detail = self.detail_branch(y) if self.use_detail_branch else zero_branch
+        contexts = [
+            branch(y) if self.use_context_branches else zero_branch
+            for branch in self.context_branches
+        ]
+        if self.use_global_branch:
+            global_context = F.interpolate(
+                self.global_branch(y),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            global_context = zero_branch
+
+        fused = self.fuse(torch.cat([detail] + contexts + [global_context], dim=1))
+        if self.use_channel_gate:
+            fused = fused * self.channel_gate(fused)
+        if self.use_spatial_gate:
+            fused = fused * self.spatial_gate(fused)
+        return x + self.residual_weight * fused
+
+
+class MultiLevelFeatureFusion(nn.Module):
+    """Fuse shallow detail, mid-level context, and high-resolution semantic features."""
+
+    def __init__(
+            self,
+            low_channels,
+            mid_channels,
+            out_channels,
+            act="silu",
+            pool_kernel_sizes=(5, 9, 13),
+            use_detail_branch=True,
+            use_context_branches=True,
+            use_global_branch=True,
+            use_channel_gate=True,
+            use_spatial_gate=True,
+    ):
+        super().__init__()
+        hidden_channels = max(out_channels // 2, 1)
+        self.low_proj = BaseConv(low_channels, hidden_channels, 1, 1, act=act)
+        self.mid_proj = BaseConv(mid_channels, hidden_channels, 1, 1, act=act)
+        self.high_proj = BaseConv(out_channels, hidden_channels, 1, 1, act=act)
+        self.fuse = nn.Sequential(
+            BaseConv(hidden_channels * 3, out_channels, 3, 1, act=act),
+            MultiScaleFeatureFusion(
+                out_channels,
+                act=act,
+                pool_kernel_sizes=pool_kernel_sizes,
+                use_detail_branch=use_detail_branch,
+                use_context_branches=use_context_branches,
+                use_global_branch=use_global_branch,
+                use_channel_gate=use_channel_gate,
+                use_spatial_gate=use_spatial_gate,
+            ),
+        )
+        self.residual_weight = nn.Parameter(torch.ones(1) * 0.1)
+
+    def forward(self, low_feature, mid_feature, high_feature):
+        target_size = high_feature.shape[-2:]
+        low_feature = F.interpolate(
+            self.low_proj(low_feature),
+            size=target_size,
             mode="bilinear",
             align_corners=False,
         )
-
-        fused = self.fuse(torch.cat([detail] + contexts + [global_context], dim=1))
-        fused = fused * self.channel_gate(fused) * self.spatial_gate(fused)
-        return x + self.residual_weight * fused
+        mid_feature = F.interpolate(
+            self.mid_proj(mid_feature),
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        high_feature_proj = self.high_proj(high_feature)
+        fused = self.fuse(torch.cat([low_feature, mid_feature, high_feature_proj], dim=1))
+        return high_feature + self.residual_weight * fused
 
 
 class TTCBase(nn.Module):
@@ -73,6 +154,11 @@ class TTCBase(nn.Module):
             kszie = 7,
             use_multiscale_fusion=False,
             multiscale_pool_kernel_sizes=(5, 9, 13),
+            use_ms_detail_branch=True,
+            use_ms_context_branches=True,
+            use_ms_global_branch=True,
+            use_ms_channel_gate=True,
+            use_ms_spatial_gate=True,
     ):
         super().__init__()
 
@@ -98,11 +184,19 @@ class TTCBase(nn.Module):
             Conv(base_channels * 2, base_channels * 2, kszie, 1, act=act),
             Conv(base_channels * 2, base_channels * 2, kszie, 1, act=act)
         )
+        self.use_multiscale_fusion = use_multiscale_fusion
         self.multiscale_fusion = (
-            MultiScaleFeatureFusion(
+            MultiLevelFeatureFusion(
+                base_channels,
+                base_channels * 2,
                 base_channels * 2,
                 act=act,
                 pool_kernel_sizes=multiscale_pool_kernel_sizes,
+                use_detail_branch=use_ms_detail_branch,
+                use_context_branches=use_ms_context_branches,
+                use_global_branch=use_ms_global_branch,
+                use_channel_gate=use_ms_channel_gate,
+                use_spatial_gate=use_ms_spatial_gate,
             )
             if use_multiscale_fusion
             else nn.Identity()
@@ -117,5 +211,6 @@ class TTCBase(nn.Module):
         h, w = x.shape[-2:]
         x = self.upsample(x, output_size=(h * 2, w * 2))
         x = self.stage3(x)
-        x = self.multiscale_fusion(x)
+        if self.use_multiscale_fusion:
+            x = self.multiscale_fusion(outputs["stem"], outputs["stage2"], x)
         return x#{k: v for k, v in outputs.items() if k in self.out_features}

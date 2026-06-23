@@ -1,4 +1,5 @@
 ./TTC_outputs/
+output/
 
 # User-specific stuff
 .idea
@@ -15,3 +16,10 @@ __pycache__/
 # Distribution / packaging
 .Python
 ./cuda_op/build/
+./cuda_ops/*.egg-info/
+./cuda_ops/dist/
+./cuda_ops/build/
+TTC_outputs/
+cuda_ops/build/
+cuda_ops/dist/
+cuda_ops/*.egg-info/

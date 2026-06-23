@@ -144,7 +144,11 @@ def get_topk_scale(scale_outputs, shift_outputs, scale_list, topk=1, return_out=
     diff = scale_outputs - shift_outputs
 
     diff = diff ** 2
-    diff = torch.mean(diff.reshape(M, N, -1), dim=-1)  # M x N
+    diff_map = diff.reshape(M, N, -1)
+    mean_diff = torch.mean(diff_map, dim=-1)
+    topk_count = max(1, diff_map.shape[-1] // 20)
+    local_diff = torch.topk(diff_map, k=topk_count, dim=-1, largest=False).values.mean(dim=-1)
+    diff = 0.7 * mean_diff + 0.3 * local_diff  # M x N
     score = 1 / diff / 255
     best_score_under_shift, best_score_under_shift_idx = torch.max(score, dim=0)  # N
     topk_score, topk_score_idx = torch.topk(best_score_under_shift, topk)

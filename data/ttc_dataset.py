@@ -96,9 +96,12 @@ class TSTTCDataset(torchDataset):
         self.min_size_after_padding = min_size_after_padding
         self.receptive_filed = receptive_filed
         self.anno_ids = self.tsttc.getAnnoIds()
-        if training and training_data_ratio < 1.0:
-            random.shuffle(self.anno_ids)
-            self.anno_ids = self.anno_ids[:int(len(self.anno_ids)*training_data_ratio)]
+        if training_data_ratio < 1.0:
+            if training:
+                random.shuffle(self.anno_ids)
+            else:
+                random.Random(0).shuffle(self.anno_ids)
+            self.anno_ids = self.anno_ids[:max(1, int(len(self.anno_ids) * training_data_ratio))]
         self.annos = self.tsttc.loadAnnos(self.anno_ids)
         self.img_ids = self.tsttc.getImgSeqIds()
         self.imgSeqsAnnos = self.tsttc.loadImgSeqs(self.img_ids)

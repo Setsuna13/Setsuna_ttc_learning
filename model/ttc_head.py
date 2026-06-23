@@ -2,6 +2,7 @@ from torch import nn
 from .network_blocks import FocalLoss
 from torchvision.ops import roi_align
 import torch
+import torch.nn.functional as F
 from data.ttc_dataset import ttc_to_scale_ratio, scale_ratio_to_ttc
 
 
@@ -21,6 +22,10 @@ class TTCHead(nn.Module):
             normed_box = False,
             sequence_len = 6,
             smoother_factor = 1.0,
+            head_type = "bce",
+            normalize_similarity = True,
+            similarity_topk_ratio = 0.05,
+            similarity_topk_weight = 0.4,
             **kwargs
     ):
         super().__init__()
@@ -43,6 +48,11 @@ class TTCHead(nn.Module):
         self.normed_box = normed_box
         self.scale_preds = nn.Linear(scale_number, scale_number)
         self.smoother_factor = smoother_factor # training only
+        self.head_type = head_type
+        self.normalize_similarity = normalize_similarity
+        self.similarity_topk_ratio = similarity_topk_ratio
+        self.similarity_topk_weight = similarity_topk_weight
+        self.ce_loss = nn.CrossEntropyLoss()
 
     def forward(self, xin, tar_boxes,ref_boxes,ttc_imu =None,**kwargs):
         '''
@@ -70,15 +80,34 @@ class TTCHead(nn.Module):
             ref_features = roi_align(xin[::2, ], ref_boxes, (G, G)) #boxes*scale_number,C,H,W
             ref_features = ref_features.view([Box,-1,xin.shape[1], G, G])#boxes,scale_number,C,H,W
             ref_features = ref_features.flatten(start_dim=-2).permute([0,1,3,2]).unsqueeze(-1)#boxes,scale_number,H*W,C,1
+        if self.normalize_similarity:
+            tar_tensor = F.normalize(tar_tensor, p=2, dim=-1, eps=1e-6)
+            ref_features = F.normalize(ref_features, p=2, dim=-2, eps=1e-6)
         #TODO add codes for other distance type here
         simlarities_map = torch.matmul(tar_tensor, ref_features).squeeze(-1).squeeze(-1) #boxes,scale_number,H*W
 
-        simlarities_scale = torch.mean(simlarities_map,dim=-1) #boxes,scale_number
+        mean_score = torch.mean(simlarities_map,dim=-1) #boxes,scale_number
+        topk_weight = max(0.0, min(1.0, self.similarity_topk_weight))
+        if topk_weight > 0:
+            topk_ratio = max(0.0, min(1.0, self.similarity_topk_ratio))
+            topk_count = max(1, int(simlarities_map.shape[-1] * topk_ratio))
+            topk_score = simlarities_map.topk(k=topk_count, dim=-1).values.mean(dim=-1)
+            simlarities_scale = (1.0 - topk_weight) * mean_score + topk_weight * topk_score
+        else:
+            simlarities_scale = mean_score
         if self.shift:
             simlarities_scale = torch.max(simlarities_scale.view([-1,self.scale_number, self.shift_kernel_size ** 2]), dim=-1).values
 
         predictions = self.scale_preds(simlarities_scale)
         if self.training:
+            if self.head_type == "distribution":
+                if 'dictAnnos' in kwargs:
+                    frame_gap = kwargs['dictAnnos']['frame_gap']
+                else:
+                    frame_gap = self.sequence_len - 1
+                gt_scales = self.prepare_targets(ttc_imu, frame_gap).type_as(predictions)
+                return self.get_distribution_loss(predictions, gt_scales, scale_list)
+
             predictions = predictions.view(-1,1)
             if 'dictAnnos' in kwargs:
                 dictAnnos = kwargs['dictAnnos']
@@ -88,6 +117,8 @@ class TTCHead(nn.Module):
             gt_one_hot = self.gt_to_one_hot(ttc_imu, gap=frame_gap,scale_list=scale_list)
             scale_loss = self.get_loss(predictions, gt_one_hot)
             return scale_loss
+        if self.head_type == "distribution":
+            return F.softmax(predictions, dim=-1), scale_list, None
         return predictions.sigmoid(), scale_list, None
 
     def shift_split(self,ref_features):
@@ -115,6 +146,29 @@ class TTCHead(nn.Module):
         gts = gts.reshape(-1, self.scale_number)
         _, gt_bin = torch.max(gts, -1, keepdim=False)
         return scale_loss
+
+    def prepare_targets(self, gts, gap):
+        if isinstance(gap, (list, tuple)):
+            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / float(tmp_gap)) for ttc, tmp_gap in zip(gts, gap)]
+        elif torch.is_tensor(gap):
+            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / float(tmp_gap)) for ttc, tmp_gap in zip(gts, gap)]
+        else:
+            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / gap) for ttc in gts]
+        return torch.tensor(scale_gt)
+
+    def get_distribution_loss(self, logits, gt_scales, scale_list):
+        step = (self.max_scale - self.min_scale) / (self.scale_number - 1)
+        float_idx = ((gt_scales - self.min_scale) / step).clamp(0, self.scale_number - 1)
+
+        idx_l = float_idx.floor().long().clamp(0, self.scale_number - 1)
+        idx_r = float_idx.ceil().long().clamp(0, self.scale_number - 1)
+        weight_r = float_idx - idx_l
+        weight_l = 1.0 - weight_r
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        loss_l = F.nll_loss(log_probs, idx_l, reduction="none")
+        loss_r = F.nll_loss(log_probs, idx_r, reduction="none")
+        return (loss_l * weight_l + loss_r * weight_r).mean()
 
     def gt_to_one_hot(self, gts, gap, scale_list):
         if type(gap) is list:

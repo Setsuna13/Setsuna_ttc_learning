@@ -45,6 +45,10 @@ class TTCEvaluator:
         ):
             with torch.no_grad():
                 imgs = imgs.type(tensor_type)
+                if torch.is_tensor(candidate_boxes):
+                    candidate_boxes = candidate_boxes.to(
+                        device=imgs.device, dtype=imgs.dtype, non_blocking=True
+                    )
                 is_time_record = cur_iter < len(self.dataloader) - 1
                 if is_time_record:
                     start = time.time()
@@ -156,9 +160,8 @@ class TTCEvaluator:
         for i in range(len(self.ttc_range[:-1])):
             lower, upper = self.ttc_range[i], self.ttc_range[i + 1]
             # select errors in range [lowe,upper]
-            mask_l = np.tile(np.expand_dims(data[:, -2] > lower, axis=1), (1, 4))
-            mask_u = np.tile(np.expand_dims(upper > data[:, -2], axis=1), (1, 4))
-            errors = np.reshape(data[:, :4][mask_l * mask_u], [-1, 4])
+            mask = (data[:, -2] > lower) & (upper > data[:, -2])
+            errors = data[mask, :4]
             ttc_dict['ttc ' + str(lower) + '~' + str(upper)] = errors
 
         return [ttc_dict]

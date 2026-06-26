@@ -121,13 +121,17 @@ def get_cropped_imgs(ref_img, tar_img, ref_box, tar_box, receptive_filed=32, max
     return [ref, tar], ref_padding, tar_padding
 
 
-def padding_image_to_same(imgs, boxes_pd, swap=(2, 0, 1), dst_size=[200, 200]):
+def padding_image_to_same(imgs, boxes_pd, swap=(2, 0, 1), dst_size=None):
     '''
     :param imgs: a list of imgs with different size
     :return: list of img with the max size of given imgs, constant padding. list of original img size
     '''
     padded_img_list = []
     orininal_box_list = []
+    if dst_size is None:
+        dst_size = [200, 200]
+    else:
+        dst_size = list(dst_size)
     for img, box_pd in zip(imgs, boxes_pd):
         H, W = img.shape[:2]
         dst_size[0], dst_size[1] = max(dst_size[0], H), max(dst_size[1], W)
@@ -164,7 +168,7 @@ def bbox_norm2abs(bbox, img_shape):
         assert bbox.shape[1] >= 4
     img_shape = np.array(img_shape)  # w, h
     bbox *= np.tile(img_shape, 2)
-    bbox = np.array(bbox, dtype=np.int)
+    bbox = np.array(bbox, dtype=int)
     return [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
 
 

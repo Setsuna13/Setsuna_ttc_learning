@@ -132,7 +132,7 @@ def main(exp, args, num_gpu):
     torch.cuda.set_device(rank)
     model.cuda(rank)
     model.eval()
-    evaluator = exp.get_evaluator(args.batch_size, 0)
+    evaluator = exp.get_evaluator(args.batch_size, is_distributed)
     ckpt_file = args.ckpt
     logger.info("loading checkpoint from {}".format(ckpt_file))
     loc = "cuda:{}".format(rank)

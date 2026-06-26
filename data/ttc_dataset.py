@@ -139,8 +139,7 @@ class TSTTCDataset(torchDataset):
         if self.first_last:
             cur_idx,ref_idx = -1,0
         else: #TODO fix this
-            print('not implemented')
-            exit(0)
+            raise NotImplementedError("TSTTCDataset currently supports first_last=True only.")
         if self.whole_img:
             frameSeq = self.tsttc.frameSeqs[index]
             for i in range(len(frameSeq)):

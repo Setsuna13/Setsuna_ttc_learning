@@ -38,14 +38,18 @@ class DataPrefetcher:
         ttc = self.next_ttc
         if input is not None:
             self.record_stream(input)
+        if enlarge_boxes is not None and torch.is_tensor(enlarge_boxes):
+            enlarge_boxes.record_stream(torch.cuda.current_stream())
 
         self.preload()
 
         return input, dictAnnos, enlarge_boxes,ttc
 
     def _input_cuda_for_image(self):
-        if self.next_input is not  None:
+        if self.next_input is not None:
             self.next_input = self.next_input.cuda(non_blocking=True)
+        if self.enlarge_boxes is not None and torch.is_tensor(self.enlarge_boxes):
+            self.enlarge_boxes = self.enlarge_boxes.cuda(non_blocking=True)
 
     @staticmethod
     def _record_stream_for_image(input):

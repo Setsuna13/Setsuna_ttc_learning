@@ -101,7 +101,7 @@ class Trainer:
             outputs = self.model(inps, enlarge_boxes, dictAnnos, ttc)
             loss = outputs["total_loss"]
             if loss < 200:
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()

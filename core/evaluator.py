@@ -43,7 +43,7 @@ class TTCEvaluator:
         for cur_iter, (imgs, annos, candidate_boxes, ttc_gts_tensor) in enumerate(
                 progress_bar(self.dataloader)
         ):
-            with torch.no_grad():
+            with torch.inference_mode():
                 imgs = imgs.type(tensor_type)
                 if torch.is_tensor(candidate_boxes):
                     candidate_boxes = candidate_boxes.to(
@@ -51,7 +51,7 @@ class TTCEvaluator:
                     )
                 is_time_record = cur_iter < len(self.dataloader) - 1
                 if is_time_record:
-                    start = time.time()
+                    start = time_synchronized()
 
                 outputs, scale_list, pred_scales = model.forward(imgs, candidate_boxes, annos)
 

@@ -68,6 +68,10 @@ class Exp(BaseExp):
         self.normalize_similarity = False
         self.similarity_topk_ratio = 0.05
         self.similarity_topk_weight = 0.0
+        # direct cross-attention TTC head: predicts scale/TTC logits without per-scale ROI Align enumeration
+        self.use_cross_attention_head = True
+        self.cross_attention_grid_size = 16
+        self.cross_attention_position_sigma = 0.35
 
         # ---------------- dataloader config ---------------- #
         # set worker to 8 for shorter dataloader init time
@@ -179,6 +183,7 @@ class Exp(BaseExp):
             use_ms_spatial_gate=self.use_ms_spatial_gate,
         )
         head = TTCHead(scale_number=self.scale_num, width=self.width,
+                       in_channel=int(self.width * 24),
                        fps=10 / (self.sequence_len - 1), ttc_bin=self.ttc_bin, min_scale=self.min_scale,
                        max_scale=self.max_scale, distance_type=self.distance_type, shift=self.shift,
                        shift_kernel_size=self.shift_size, grid_size=self.grid_size, normed_box=self.normed_box,
@@ -186,7 +191,10 @@ class Exp(BaseExp):
                        head_type=self.head_type,
                        normalize_similarity=self.normalize_similarity,
                        similarity_topk_ratio=self.similarity_topk_ratio,
-                       similarity_topk_weight=self.similarity_topk_weight)
+                       similarity_topk_weight=self.similarity_topk_weight,
+                       use_cross_attention=self.use_cross_attention_head,
+                       cross_attention_grid_size=self.cross_attention_grid_size,
+                       cross_attention_position_sigma=self.cross_attention_position_sigma)
 
         def init_model(M):
             for m in M.modules():

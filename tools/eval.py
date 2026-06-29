@@ -137,7 +137,14 @@ def main(exp, args, num_gpu):
     logger.info("loading checkpoint from {}".format(ckpt_file))
     loc = "cuda:{}".format(rank)
     ckpt = torch.load(ckpt_file, map_location=loc)
-    model.load_state_dict(ckpt["model"])
+    try:
+        model.load_state_dict(ckpt["model"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint is not compatible with the current direct cross-attention head. "
+            "Evaluate a checkpoint trained with this head, or fine-tune from an old baseline "
+            "checkpoint via tools/train.py -c <old_ckpt> so the new head parameters are initialized and trained."
+        ) from exc
     logger.info("loaded checkpoint done.")
     if is_distributed:
         model = DDP(model, device_ids=[rank])

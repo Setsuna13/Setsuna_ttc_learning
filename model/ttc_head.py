@@ -76,6 +76,7 @@ class TTCHead(nn.Module):
         self.v_proj = nn.Linear(attn_dim, attn_dim)
         self.out_proj = nn.Linear(attn_dim, attn_dim)
         self.token_type_embed = nn.Embedding(2, attn_dim)
+        self.position_proj = nn.Linear(2, attn_dim)
         self.scale_index_embed = nn.Embedding(scale_number, attn_dim)
         self.scale_value_proj = nn.Sequential(
             nn.Linear(1, attn_dim),
@@ -117,7 +118,7 @@ class TTCHead(nn.Module):
                     frame_gap = kwargs['dictAnnos']['frame_gap']
                 else:
                     frame_gap = self.sequence_len - 1
-                gt_scales = self.prepare_targets(ttc_imu, frame_gap).type_as(predictions)
+                gt_scales = self.prepare_targets(ttc_imu, frame_gap, predictions)
                 return self.get_distribution_loss(predictions, gt_scales, scale_list)
 
             predictions = predictions.view(-1,1)
@@ -126,7 +127,7 @@ class TTCHead(nn.Module):
                 frame_gap = dictAnnos['frame_gap']
             else:
                 frame_gap = self.sequence_len-1
-            gt_one_hot = self.gt_to_one_hot(ttc_imu, gap=frame_gap,scale_list=scale_list)
+            gt_one_hot = self.gt_to_one_hot(ttc_imu, gap=frame_gap,scale_list=scale_list, ref_tensor=predictions)
             scale_loss = self.get_loss(predictions, gt_one_hot)
             return scale_loss
         if self.head_type == "distribution":
@@ -144,8 +145,11 @@ class TTCHead(nn.Module):
         ref_tokens = self.sample_box_tokens(ref_maps, ref_boxes, attn_grid, H, W, context_scale)
         tar_tokens = self.sample_box_tokens(tar_maps, tar_boxes, attn_grid, H, W, 1.0)
 
-        ref_tokens = self.ref_proj(ref_tokens) + self.token_type_embed.weight[0].view(1, 1, -1)
-        tar_tokens = self.tar_proj(tar_tokens) + self.token_type_embed.weight[1].view(1, 1, -1)
+        position_embed = self.position_proj(
+            self.grid_position_tokens(attn_grid, xin.device, xin.dtype)
+        )
+        ref_tokens = self.ref_proj(ref_tokens) + self.token_type_embed.weight[0].view(1, 1, -1) + position_embed
+        tar_tokens = self.tar_proj(tar_tokens) + self.token_type_embed.weight[1].view(1, 1, -1) + position_embed
         pair_geometry = self.box_pair_geometry(ref_boxes, tar_boxes, H, W).type_as(xin)
         geometry_embed = self.geometry_proj(pair_geometry)
         pair_tokens = torch.cat([ref_tokens, tar_tokens], dim=1)
@@ -162,6 +166,13 @@ class TTCHead(nn.Module):
         context = torch.matmul(attn, v)
         scale_states = self.context_norm(scale_queries + self.out_proj(context))
         return self.pred_head(scale_states).squeeze(-1)
+
+    def grid_position_tokens(self, output_size, device, dtype):
+        coords = torch.linspace(-1.0, 1.0, output_size, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        positions = torch.stack([xx, yy], dim=-1).view(1, output_size * output_size, 2)
+        sigma = max(float(self.cross_attention_position_sigma), 1e-3)
+        return positions / sigma
 
     def build_scale_queries(self, scale_list, geometry_embed):
         scale_list = scale_list.to(device=geometry_embed.device, dtype=geometry_embed.dtype)
@@ -273,14 +284,20 @@ class TTCHead(nn.Module):
         _, gt_bin = torch.max(gts, -1, keepdim=False)
         return scale_loss
 
-    def prepare_targets(self, gts, gap):
+    def prepare_targets(self, gts, gap, ref_tensor=None):
+        if ref_tensor is not None:
+            gts = torch.as_tensor(gts, device=ref_tensor.device, dtype=ref_tensor.dtype)
+        elif not torch.is_tensor(gts):
+            gts = torch.as_tensor(gts)
+
         if isinstance(gap, (list, tuple)):
-            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / float(tmp_gap)) for ttc, tmp_gap in zip(gts, gap)]
+            gap_tensor = torch.as_tensor(gap, device=gts.device, dtype=gts.dtype)
         elif torch.is_tensor(gap):
-            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / float(tmp_gap)) for ttc, tmp_gap in zip(gts, gap)]
+            gap_tensor = gap.to(device=gts.device, dtype=gts.dtype)
         else:
-            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / gap) for ttc in gts]
-        return torch.tensor(scale_gt)
+            gap_tensor = torch.full_like(gts, float(gap))
+        fps = 10.0 / gap_tensor
+        return ttc_to_scale_ratio(gts, fps=fps)
 
     def get_distribution_loss(self, logits, gt_scales, scale_list):
         step = (self.max_scale - self.min_scale) / (self.scale_number - 1)
@@ -296,18 +313,24 @@ class TTCHead(nn.Module):
         loss_r = F.nll_loss(log_probs, idx_r, reduction="none")
         return (loss_l * weight_l + loss_r * weight_r).mean()
 
-    def gt_to_one_hot(self, gts, gap, scale_list):
-        if type(gap) is list:
-            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / tmp_gap) for ttc,tmp_gap in zip(gts,gap)]
+    def gt_to_one_hot(self, gts, gap, scale_list, ref_tensor=None):
+        if ref_tensor is not None:
+            gts = torch.as_tensor(gts, device=ref_tensor.device, dtype=ref_tensor.dtype)
+            scale_list = scale_list.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        elif not torch.is_tensor(gts):
+            gts = torch.as_tensor(gts)
+
+        if isinstance(gap, (list, tuple)):
+            gap_tensor = torch.as_tensor(gap, device=gts.device, dtype=gts.dtype)
+        elif torch.is_tensor(gap):
+            gap_tensor = gap.to(device=gts.device, dtype=gts.dtype)
         else:
-            scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / gap) for ttc in gts]
-        scale_number,gt_number,range_list = self.scale_number,len(gts),scale_list
-        if torch.is_tensor(range_list):
-            range_tensor = range_list.detach().clone().view([-1, scale_number])
-        else:
-            range_tensor = torch.tensor(range_list).view([-1, scale_number])
-        range_tensor = range_tensor.repeat(gt_number, 1)
-        gts_tensor = torch.tensor(scale_gt).view(gt_number, -1).repeat([1, scale_number]).type_as(range_tensor)
+            gap_tensor = torch.full_like(gts, float(gap))
+
+        scale_number, gt_number = self.scale_number, gts.numel()
+        scale_gt = ttc_to_scale_ratio(gts, fps=10.0 / gap_tensor)
+        range_tensor = scale_list.detach().clone().view(1, scale_number).repeat(gt_number, 1)
+        gts_tensor = scale_gt.view(gt_number, 1).repeat(1, scale_number).type_as(range_tensor)
 
         ones_mat = torch.ones_like(gts_tensor)
         zero_mat = torch.zeros_like(ones_mat)

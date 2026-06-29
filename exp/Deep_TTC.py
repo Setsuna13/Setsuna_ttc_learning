@@ -182,8 +182,9 @@ class Exp(BaseExp):
             use_ms_channel_gate=self.use_ms_channel_gate,
             use_ms_spatial_gate=self.use_ms_spatial_gate,
         )
+        head_in_channel = int(self.width * 12) * 2
         head = TTCHead(scale_number=self.scale_num, width=self.width,
-                       in_channel=int(self.width * 24),
+                       in_channel=head_in_channel,
                        fps=10 / (self.sequence_len - 1), ttc_bin=self.ttc_bin, min_scale=self.min_scale,
                        max_scale=self.max_scale, distance_type=self.distance_type, shift=self.shift,
                        shift_kernel_size=self.shift_size, grid_size=self.grid_size, normed_box=self.normed_box,

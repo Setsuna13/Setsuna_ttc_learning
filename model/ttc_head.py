@@ -192,6 +192,7 @@ class TTCHead(nn.Module):
         return queries.unsqueeze(0).expand(geometry_embed.shape[0], -1, -1) + geometry_embed.unsqueeze(1)
 
     def sample_box_tokens(self, feature_maps, boxes, output_size, H, W, context_scale):
+        boxes = boxes.to(device=feature_maps.device, dtype=feature_maps.dtype)
         box_xyxy = self.boxes_to_feature_xyxy(boxes, H, W)
         batch_index = boxes[:, 0].long().clamp(min=0, max=feature_maps.shape[0] - 1)
         selected_features = feature_maps.index_select(0, batch_index)

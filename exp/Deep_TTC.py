@@ -68,6 +68,39 @@ class Exp(BaseExp):
         self.normalize_similarity = False
         self.similarity_topk_ratio = 0.05
         self.similarity_topk_weight = 0.0
+        # Optional per-scale residual distribution head. Keep disabled for baseline compatibility.
+        self.use_per_bin_residual_head = False
+        self.residual_bin_num = 31
+        self.residual_scale_range = 0.03
+        self.residual_loss_weight = 0.3
+        self.final_scale_loss_weight = 0.5
+        self.residual_short_loss_weight = 0.05
+        self.residual_mid_ttc_abs_thresh = 3.0
+        self.residual_mid_loss_weight = 0.3
+        self.residual_long_ttc_abs_thresh = 6.0
+        self.residual_long_loss_weight = 1.0
+        self.residual_tail_ttc_abs_thresh = 12.0
+        self.residual_tail_loss_weight = 1.2
+        # Optional TTC-aware scale bins and direct TTC-metric alignment loss.
+        self.scale_bin_mode = "linear"
+        self.scale_bin_density_power = 2.5
+        self.scale_bin_center = 1.0
+        self.use_ttc_metric_loss = False
+        self.ttc_metric_loss_weight = 1.0
+        self.ttc_metric_clip = 20.0
+        self.ttc_metric_min_denom = 1.0
+        self.ttc_metric_huber_beta = 0.1
+        self.ttc_metric_short_loss_weight = 0.02
+        self.ttc_metric_mid_ttc_abs_thresh = 3.0
+        self.ttc_metric_mid_loss_weight = 0.25
+        self.ttc_metric_long_ttc_abs_thresh = 6.0
+        self.ttc_metric_long_loss_weight = 1.0
+        self.ttc_metric_tail_ttc_abs_thresh = 12.0
+        self.ttc_metric_tail_loss_weight = 1.2
+        # Freeze options for calibration-style fine-tuning from a strong checkpoint.
+        self.freeze_backbone = False
+        self.unfreeze_multiscale_fusion = False
+        self.freeze_scale_head = False
 
         # ---------------- dataloader config ---------------- #
         # set worker to 8 for shorter dataloader init time
@@ -81,6 +114,10 @@ class Exp(BaseExp):
         # self.random_size = (14, 26)
         # only use two image or the whole seq
         self.use_all = False
+        # Enumerate frame pairs from the 6-frame sequence for training augmentation.
+        self.use_all_frame_pairs = False
+        # 0 means use all C(sequence_len, 2) pairs; otherwise sample this many pairs per sequence.
+        self.frame_pair_sample_num = 0
         # box level training & evaluation or not, could speed training 3x times but decrease accuracy
         self.box_level = True
         # minimal padding size after crop obj in a batch |box level only|
@@ -120,8 +157,19 @@ class Exp(BaseExp):
         self.dynamic_ratio_aug = 1.0
         # prob of applying reverse aug
         self.reverse_aug_prob = 0
+        # False: randomly flips a sampled pair in-place; True: appends reversed copies to the dataset index.
+        self.reverse_aug_append = False
+        # sign: -6 -> 6; reciprocal_scale: choose TTC so the target scale ratio is exactly reciprocal.
+        self.reverse_ttc_mode = "sign"
         # noisy box ratio to the ref box center(means ratio*H or W)
         self.noisy_box_ratio = 0
+        # Use neighboring clean annotation boxes for crop only when a box is visibly unstable.
+        # Disabled by default so baseline reproduction is unchanged.
+        self.use_robust_box_crop = False
+        self.robust_box_occ_thresh = 0.3
+        self.robust_box_area_ratio_thresh = 1.8
+        self.robust_box_height_ratio_thresh = 1.6
+        self.robust_box_center_shift_thresh = 0.0
 
         # --------------  training config --------------------- #
         # epoch number used for warmup
@@ -186,7 +234,34 @@ class Exp(BaseExp):
                        head_type=self.head_type,
                        normalize_similarity=self.normalize_similarity,
                        similarity_topk_ratio=self.similarity_topk_ratio,
-                       similarity_topk_weight=self.similarity_topk_weight)
+                       similarity_topk_weight=self.similarity_topk_weight,
+                       use_per_bin_residual_head=self.use_per_bin_residual_head,
+                       residual_bin_num=self.residual_bin_num,
+                       residual_scale_range=self.residual_scale_range,
+                       residual_loss_weight=self.residual_loss_weight,
+                       final_scale_loss_weight=self.final_scale_loss_weight,
+                       residual_short_loss_weight=self.residual_short_loss_weight,
+                       residual_mid_ttc_abs_thresh=self.residual_mid_ttc_abs_thresh,
+                       residual_mid_loss_weight=self.residual_mid_loss_weight,
+                       residual_long_ttc_abs_thresh=self.residual_long_ttc_abs_thresh,
+                       residual_long_loss_weight=self.residual_long_loss_weight,
+                       residual_tail_ttc_abs_thresh=self.residual_tail_ttc_abs_thresh,
+                       residual_tail_loss_weight=self.residual_tail_loss_weight,
+                       scale_bin_mode=self.scale_bin_mode,
+                       scale_bin_density_power=self.scale_bin_density_power,
+                       scale_bin_center=self.scale_bin_center,
+                       use_ttc_metric_loss=self.use_ttc_metric_loss,
+                       ttc_metric_loss_weight=self.ttc_metric_loss_weight,
+                       ttc_metric_clip=self.ttc_metric_clip,
+                       ttc_metric_min_denom=self.ttc_metric_min_denom,
+                       ttc_metric_huber_beta=self.ttc_metric_huber_beta,
+                       ttc_metric_short_loss_weight=self.ttc_metric_short_loss_weight,
+                       ttc_metric_mid_ttc_abs_thresh=self.ttc_metric_mid_ttc_abs_thresh,
+                       ttc_metric_mid_loss_weight=self.ttc_metric_mid_loss_weight,
+                       ttc_metric_long_ttc_abs_thresh=self.ttc_metric_long_ttc_abs_thresh,
+                       ttc_metric_long_loss_weight=self.ttc_metric_long_loss_weight,
+                       ttc_metric_tail_ttc_abs_thresh=self.ttc_metric_tail_ttc_abs_thresh,
+                       ttc_metric_tail_loss_weight=self.ttc_metric_tail_loss_weight)
 
         def init_model(M):
             for m in M.modules():
@@ -197,6 +272,15 @@ class Exp(BaseExp):
         self.model = TTCNet(backbone, head)
 
         self.model.apply(init_model)
+        if self.freeze_backbone:
+            for param in self.model.backbone.parameters():
+                param.requires_grad = False
+            if self.unfreeze_multiscale_fusion:
+                for param in self.model.backbone.multiscale_fusion.parameters():
+                    param.requires_grad = True
+        if self.freeze_scale_head:
+            for param in self.model.head.scale_preds.parameters():
+                param.requires_grad = False
 
         return self.model
 
@@ -301,12 +385,17 @@ class Exp(BaseExp):
         # TODO: fix max_boxSize param
         valArgs = {
             'data_path': data_path, 'anno_path': anno_path, 'img_size': self.test_size, 'preproc': ValTransform(),
-            'seq_len': self.sequence_len, 'first_last': not self.use_all, 'training': False,
+            'seq_len': self.sequence_len, 'first_last': True, 'training': False,
             'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
             'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
             'default_max_scale':self.max_scale,
             'grid_size':self.grid_size,
-            'training_data_ratio': self.val_data_ratio
+            'training_data_ratio': self.val_data_ratio,
+            'use_robust_box_crop': self.use_robust_box_crop,
+            'robust_box_occ_thresh': self.robust_box_occ_thresh,
+            'robust_box_area_ratio_thresh': self.robust_box_area_ratio_thresh,
+            'robust_box_height_ratio_thresh': self.robust_box_height_ratio_thresh,
+            'robust_box_center_shift_thresh': self.robust_box_center_shift_thresh
         }
         if self.box_level:
             valArgs['preproc'] = None
@@ -341,12 +430,24 @@ class Exp(BaseExp):
             trainArgs = {
                 'data_path': self.trainset_dir, 'anno_path': self.trainAnnoPath, 'img_size': self.test_size,
                 'preproc': TrainTransform(hsv_prob=self.hsv_prob),
-                'seq_len': self.sequence_len, 'first_last': not self.use_all, 'training': True,
+                'seq_len': self.sequence_len,
+                'first_last': not (self.use_all or self.use_all_frame_pairs),
+                'training': True,
                 'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
                 'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
                 'default_max_scale': self.max_scale,
                 'grid_size': self.grid_size,
-                'training_data_ratio': self.training_data_ratio
+                'training_data_ratio': self.training_data_ratio,
+                'use_all_frame_pairs': self.use_all or self.use_all_frame_pairs,
+                'frame_pair_sample_num': self.frame_pair_sample_num,
+                'reverse_aug_prob': self.reverse_aug_prob,
+                'reverse_aug_append': self.reverse_aug_append,
+                'reverse_ttc_mode': self.reverse_ttc_mode,
+                'use_robust_box_crop': self.use_robust_box_crop,
+                'robust_box_occ_thresh': self.robust_box_occ_thresh,
+                'robust_box_area_ratio_thresh': self.robust_box_area_ratio_thresh,
+                'robust_box_height_ratio_thresh': self.robust_box_height_ratio_thresh,
+                'robust_box_center_shift_thresh': self.robust_box_center_shift_thresh
             }
             if self.box_level:
                 trainArgs['preproc'] = TrainTransformSeqLevel(hsv_prob=self.hsv_prob)

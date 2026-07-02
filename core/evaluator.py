@@ -26,7 +26,34 @@ class TTCEvaluator:
         self.sequence_len = sequence_len
         self.scale_number = scale_number
         self.fps = fps
+        self.mid_fps = 10
         self.ttc_range = [-20,0,3,6,20]
+
+    def get_batch_fps(self, annos, reference):
+        frame_gap = None
+        if isinstance(annos, dict):
+            frame_gap = annos.get('frame_gap')
+        if frame_gap is None:
+            frame_gap = torch.full(
+                (reference.numel(),),
+                self.sequence_len - 1,
+                dtype=reference.dtype,
+                device=reference.device,
+            )
+        else:
+            frame_gap = torch.as_tensor(frame_gap, dtype=reference.dtype, device=reference.device).view(-1)
+            if frame_gap.numel() == 0:
+                frame_gap = torch.full_like(reference.view(-1), self.sequence_len - 1)
+            elif frame_gap.numel() == 1 and reference.numel() != 1:
+                frame_gap = frame_gap.expand(reference.numel())
+            elif frame_gap.numel() != reference.numel():
+                raise ValueError(
+                    "frame_gap count {} does not match prediction count {}".format(
+                        frame_gap.numel(), reference.numel()
+                    )
+                )
+        frame_gap = torch.clamp(frame_gap, min=1)
+        return 10.0 / frame_gap
 
     def evaluate(self, model, is_distributed=False, half=False,topk=4):
         tensor_type = torch.cuda.HalfTensor if half else torch.cuda.FloatTensor
@@ -71,7 +98,8 @@ class TTCEvaluator:
                 else:
                     pred_scales = pred_scales.reshape(-1).type_as(outputs)
 
-                pred_ttcs = scale_ratio_to_ttc(pred_scales,self.fps)
+                fps = self.get_batch_fps(annos, pred_scales)
+                pred_ttcs = scale_ratio_to_ttc(pred_scales, fps)
                 if isinstance(ttc_gts_tensor, torch.Tensor):
                     ttc_gt = ttc_gts_tensor.detach().to(device=pred_ttcs.device, dtype=pred_ttcs.dtype).view(-1)
                 else:
@@ -79,7 +107,7 @@ class TTCEvaluator:
 
                 pred_ttcs_eval = pred_ttcs.detach().float().cpu()
                 ttc_gt_eval = ttc_gt.detach().float().cpu()
-                scale_gt = ttc_to_scale_ratio(ttc_gt_eval, self.fps)
+                scale_gt = ttc_to_scale_ratio(ttc_gt_eval, self.mid_fps)
                 pred_ttc_list = pred_ttcs_eval.numpy().tolist()
                 ave_ttc_errors, tmp_ttc, ttcs_abs_error = self.compute_error_rate(pred_ttcs_eval, ttc_gt_eval,mid=False)
                 ave_scale_errors, tmp_scale, scale_abs_error = self.compute_error_rate(pred_ttcs_eval, ttc_gt_eval,mid=True)
@@ -124,8 +152,8 @@ class TTCEvaluator:
         for i in range(pred.shape[0]):
             if mid:
                 pred_ttc = max(min(pred[i], 20), -20)
-                pred_tmp = ttc_to_scale_ratio(pred_ttc, self.fps)
-                gt_tmp = ttc_to_scale_ratio(gt[i], self.fps)
+                pred_tmp = ttc_to_scale_ratio(pred_ttc, self.mid_fps)
+                gt_tmp = ttc_to_scale_ratio(gt[i], self.mid_fps)
                 error = float(abs(math.log(pred_tmp) - math.log(gt_tmp)) * 10**4)
             else:
                 pred_tmp = max(min(pred[i], 20), -20)
@@ -135,8 +163,6 @@ class TTCEvaluator:
             abs_error.append(abs(pred_tmp - gt_tmp))
             relative_errors.append(error)
         return sum(relative_errors) / len(relative_errors), relative_errors, abs_error
-
-
 
     def cal_error(self, data):
         '''
@@ -149,6 +175,11 @@ class TTCEvaluator:
         '''
         if not is_main_process():
             return []
+        if len(data) == 0:
+            return [{"ttc -20~0": np.empty((0, 4)),
+                     "ttc 0~3": np.empty((0, 4)),
+                     "ttc 3~6": np.empty((0, 4)),
+                     "ttc 6~20": np.empty((0, 4))}]
         data = np.stack(data)
         ttc_dict = {}
 

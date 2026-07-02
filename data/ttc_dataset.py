@@ -77,6 +77,16 @@ class TSTTCDataset(torchDataset):
             nerf_path=None,
             nerf_seqs = 0,
             nerf_seed = 0,
+            use_all_frame_pairs=False,
+            frame_pair_sample_num=0,
+            reverse_aug_prob=0.0,
+            reverse_aug_append=False,
+            reverse_ttc_mode="sign",
+            use_robust_box_crop=False,
+            robust_box_occ_thresh=0.3,
+            robust_box_area_ratio_thresh=1.8,
+            robust_box_height_ratio_thresh=1.6,
+            robust_box_center_shift_thresh=0.0,
             **kwargs
     ):
         super().__init__()
@@ -88,6 +98,16 @@ class TSTTCDataset(torchDataset):
         self.first_last = first_last
         self.training = training
         self.seq_len = seq_len
+        self.use_all_frame_pairs = bool(use_all_frame_pairs or (training and not first_last))
+        self.frame_pair_sample_num = int(frame_pair_sample_num)
+        self.reverse_aug_prob = float(reverse_aug_prob)
+        self.reverse_aug_append = bool(reverse_aug_append)
+        self.reverse_ttc_mode = reverse_ttc_mode
+        self.use_robust_box_crop = bool(use_robust_box_crop)
+        self.robust_box_occ_thresh = float(robust_box_occ_thresh)
+        self.robust_box_area_ratio_thresh = float(robust_box_area_ratio_thresh)
+        self.robust_box_height_ratio_thresh = float(robust_box_height_ratio_thresh)
+        self.robust_box_center_shift_thresh = float(robust_box_center_shift_thresh)
         logger.info("Loading TSTTC dataset from {}...".format(self.data_path))
         self.tsttc = TSTTC(self.data_path, self.anno_path,
                            sequence_len=seq_len)
@@ -118,12 +138,185 @@ class TSTTCDataset(torchDataset):
         self.expand_ratio = expand_ratio
         self.default_max_scale = default_max_scale
         self.grid_size = kwargs.get('grid_size',50)
+        self.sample_index = self._build_sample_index()
 
+    def _build_sample_index(self):
+        if self.whole_img:
+            return []
+        rng = random.Random(0)
+        sample_index = []
+        pair_specs = self._get_pair_specs()
+        for anno_idx in range(len(self.annos)):
+            cur_pair_specs = pair_specs
+            if 0 < self.frame_pair_sample_num < len(pair_specs):
+                cur_pair_specs = rng.sample(pair_specs, self.frame_pair_sample_num)
+            for ref_pos, cur_pos in cur_pair_specs:
+                sample_index.append((anno_idx, ref_pos, cur_pos, False))
+                if (
+                    self.training
+                    and self.reverse_aug_append
+                    and self.reverse_aug_prob > 0
+                    and rng.random() < self.reverse_aug_prob
+                ):
+                    sample_index.append((anno_idx, ref_pos, cur_pos, True))
+        return sample_index
+
+    def _get_pair_specs(self):
+        if self.use_all_frame_pairs:
+            return [
+                (ref_pos, cur_pos)
+                for ref_pos in range(self.seq_len - 1)
+                for cur_pos in range(ref_pos + 1, self.seq_len)
+            ]
+        return [(0, self.seq_len - 1)]
+
+    def _get_indexed_pair(self, index):
+        if self.sample_index:
+            anno_idx, ref_pos, cur_pos, reverse_pair = self.sample_index[index]
+        else:
+            anno_idx, ref_pos, cur_pos, reverse_pair = index, 0, self.seq_len - 1, False
+        if (
+            self.training
+            and not self.reverse_aug_append
+            and self.reverse_aug_prob > 0
+            and random.random() < self.reverse_aug_prob
+        ):
+            reverse_pair = not reverse_pair
+        return anno_idx, ref_pos, cur_pos, reverse_pair
+
+    @staticmethod
+    def _get_ttc(obj_anno):
+        try:
+            return obj_anno['ttc_imu']
+        except Exception:
+            return obj_anno.ttc_imu
+
+    @staticmethod
+    def _set_ttc(obj_anno, value):
+        try:
+            obj_anno['ttc_imu'] = value
+        except Exception:
+            obj_anno.ttc_imu = value
+
+    def _reverse_ttc(self, ttc, frame_gap):
+        if self.reverse_ttc_mode == "reciprocal_scale":
+            fps = 10 / float(frame_gap)
+            scale_ratio = ttc_to_scale_ratio(ttc, fps=fps)
+            reversed_scale_ratio = 1.0 / (scale_ratio + 1e-9)
+            return scale_ratio_to_ttc(reversed_scale_ratio, fps=fps)
+        return -ttc
+
+    def _load_pair_annos(self, seq, ref_pos, cur_pos, reverse_pair):
+        if ref_pos >= len(seq) or cur_pos >= len(seq):
+            raise IndexError("frame pair ({}, {}) out of sequence length {}".format(ref_pos, cur_pos, len(seq)))
+        frame_gap = abs(cur_pos - ref_pos)
+        if reverse_pair:
+            objAnnoRef = copy.deepcopy(seq[cur_pos])
+            objAnnoCur = copy.deepcopy(seq[ref_pos])
+            original_ttc = self._get_ttc(seq[cur_pos])
+            self._set_ttc(objAnnoCur, self._reverse_ttc(original_ttc, frame_gap))
+        else:
+            objAnnoRef = copy.deepcopy(seq[ref_pos])
+            objAnnoCur = copy.deepcopy(seq[cur_pos])
+        return objAnnoRef, objAnnoCur, frame_gap
+
+    @staticmethod
+    def _box_array(obj_anno):
+        try:
+            box = obj_anno['box2d']
+        except Exception:
+            box = obj_anno.box2d
+        return np.asarray(box, dtype=np.float32)
+
+    @staticmethod
+    def _box_occ_ratio(obj_anno):
+        try:
+            return float(obj_anno.get('occ_ratio', 0.0))
+        except Exception:
+            return float(getattr(obj_anno, 'occ_ratio', 0.0))
+
+    @staticmethod
+    def _box_stats(box):
+        w = max(float(box[2] - box[0]), 1e-6)
+        h = max(float(box[3] - box[1]), 1e-6)
+        cx = float((box[0] + box[2]) * 0.5)
+        cy = float((box[1] + box[3]) * 0.5)
+        return w, h, w * h, cx, cy
+
+    @staticmethod
+    def _sym_ratio(a, b):
+        a = max(float(a), 1e-6)
+        b = max(float(b), 1e-6)
+        return max(a / b, b / a)
+
+    def _is_box_suspicious(self, seq, pos):
+        if not self.use_robust_box_crop:
+            return False
+        if self._box_occ_ratio(seq[pos]) > self.robust_box_occ_thresh:
+            return True
+
+        boxes = [self._box_array(obj) for obj in seq]
+        ref_boxes = [
+            box for idx, box in enumerate(boxes)
+            if idx != pos and self._box_occ_ratio(seq[idx]) <= self.robust_box_occ_thresh
+        ]
+        if len(ref_boxes) == 0:
+            return False
+
+        ref_box = np.median(np.stack(ref_boxes, axis=0), axis=0)
+        cur_w, cur_h, cur_area, cur_cx, cur_cy = self._box_stats(boxes[pos])
+        ref_w, ref_h, ref_area, ref_cx, ref_cy = self._box_stats(ref_box)
+        if self._sym_ratio(cur_area, ref_area) > self.robust_box_area_ratio_thresh:
+            return True
+        if self._sym_ratio(cur_h, ref_h) > self.robust_box_height_ratio_thresh:
+            return True
+        if self.robust_box_center_shift_thresh > 0:
+            ref_diag = max((ref_w ** 2 + ref_h ** 2) ** 0.5, 1e-6)
+            center_shift = (((cur_cx - ref_cx) ** 2 + (cur_cy - ref_cy) ** 2) ** 0.5) / ref_diag
+            if center_shift > self.robust_box_center_shift_thresh:
+                return True
+        return False
+
+    def _robust_box_for_crop(self, seq, pos):
+        box = self._box_array(seq[pos])
+        if not self._is_box_suspicious(seq, pos):
+            return box
+
+        good_positions = [
+            idx for idx in range(len(seq))
+            if idx != pos and not self._is_box_suspicious(seq, idx)
+        ]
+        if len(good_positions) == 0:
+            return box
+
+        left_positions = [idx for idx in good_positions if idx < pos]
+        right_positions = [idx for idx in good_positions if idx > pos]
+        left = max(left_positions) if left_positions else None
+        right = min(right_positions) if right_positions else None
+        if left is not None and right is not None:
+            alpha = float(pos - left) / max(float(right - left), 1.0)
+            left_box = self._box_array(seq[left])
+            right_box = self._box_array(seq[right])
+            return left_box * (1.0 - alpha) + right_box * alpha
+        if left is not None:
+            return self._box_array(seq[left])
+        return self._box_array(seq[right])
+
+    def _pair_boxes_for_crop(self, seq, ref_pos, cur_pos, reverse_pair, objAnnoRef, objAnnoCur):
+        if not self.use_robust_box_crop:
+            return self._box_array(objAnnoRef), self._box_array(objAnnoCur)
+        if reverse_pair:
+            ref_box = self._robust_box_for_crop(seq, cur_pos)
+            cur_box = self._robust_box_for_crop(seq, ref_pos)
+        else:
+            ref_box = self._robust_box_for_crop(seq, ref_pos)
+            cur_box = self._robust_box_for_crop(seq, cur_pos)
+        return ref_box, cur_box
 
     def __len__(self):
         if self.whole_img:
             return len(self.tsttc.frameSeqs)
-        return len(self.annos)
+        return len(self.sample_index)
 
     def resize_img(self, img,):
         r = min(self.img_size[0] / img.shape[0], self.img_size[1] / img.shape[1])
@@ -136,11 +329,10 @@ class TSTTCDataset(torchDataset):
     def pull_item(self, index):
         result_dict = {'imgPair':[],'refBoxAnnos':[],'curBoxAnnos':[],'ttc_imu':[],\
                        'curAnnos':[],'dynamicRanges':[],'frame_gap':[],'masks':[]}
-        if self.first_last:
+        if self.first_last or not self.whole_img:
             cur_idx,ref_idx = -1,0
-        else: #TODO fix this
-            print('not implemented')
-            exit(0)
+        else: # whole-image all-pair mode is not supported; keep the legacy first/last pair.
+            cur_idx,ref_idx = -1,0
         if self.whole_img:
             frameSeq = self.tsttc.frameSeqs[index]
             for i in range(len(frameSeq)):
@@ -164,7 +356,9 @@ class TSTTCDataset(torchDataset):
                         return result_dict
                     result_dict['imgPair'].extend([imgRef,imgCur])
                 max_scale = self.default_max_scale
-                candidate_boxes = get_crop_size(objAnnoRef['box2d'], objAnnoCur['box2d'],max_scale=max_scale,expand_ratio=self.expand_ratio)
+                seq = frameSeq[i][-self.seq_len:]
+                ref_box, cur_box = self._pair_boxes_for_crop(seq, 0, self.seq_len - 1, False, objAnnoRef, objAnnoCur)
+                candidate_boxes = get_crop_size(ref_box, cur_box,max_scale=max_scale,expand_ratio=self.expand_ratio)
                 if candidate_boxes is not None:
                     result_dict['refBoxAnnos'].append(candidate_boxes[0])
                     result_dict['curBoxAnnos'].append(candidate_boxes[3])
@@ -173,9 +367,10 @@ class TSTTCDataset(torchDataset):
                     result_dict['frame_gap'].append(self.seq_len-ref_idx-1)
         else:
             result_dict['min_size_after_padding'] = self.min_size_after_padding
+            anno_idx, ref_pos, cur_pos, reverse_pair = self._get_indexed_pair(int(index))
             try:
-                objAnnoRef = copy.deepcopy(self.annos[index][-self.seq_len:][ref_idx])
-                objAnnoCur = copy.deepcopy(self.annos[index][-self.seq_len:][cur_idx])
+                seq = self.annos[anno_idx][-self.seq_len:]
+                objAnnoRef, objAnnoCur, frame_gap = self._load_pair_annos(seq, ref_pos, cur_pos, reverse_pair)
             except IndexError:
                 logger.warning('fail to load image pair: %s' % index)
                 return result_dict
@@ -187,7 +382,8 @@ class TSTTCDataset(torchDataset):
                 return result_dict
 
             max_scale = self.default_max_scale
-            candidate_boxes = get_crop_size(objAnnoRef['box2d'], objAnnoCur['box2d'], max_scale=max_scale,
+            ref_box, cur_box = self._pair_boxes_for_crop(seq, ref_pos, cur_pos, reverse_pair, objAnnoRef, objAnnoCur)
+            candidate_boxes = get_crop_size(ref_box, cur_box, max_scale=max_scale,
                                             expand_ratio=self.expand_ratio)
             if candidate_boxes is not None:
                 result_dict['refBoxAnnos'].append(candidate_boxes[0])
@@ -198,7 +394,7 @@ class TSTTCDataset(torchDataset):
                                                                 result_dict['curBoxAnnos'][0], self.receptive_filed,
                                                                 max_unit_size=self.box_downsample_thresh,
                                                                 )
-                result_dict['frame_gap'].append(self.seq_len - ref_idx - 1)
+                result_dict['frame_gap'].append(frame_gap)
 
             else:
                 logger.warning('box out of img after enlarging: %s' % objAnnoCur['img_path'])

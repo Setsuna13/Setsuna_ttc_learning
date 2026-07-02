@@ -1,0 +1,62 @@
+Robust box crop ablation summary
+================================
+
+Checkpoint:
+/home/zzqh/TTC/TSTTC/TTC_outputs/head+multi/best_ckpt.pth
+
+Change tested:
+- Added use_robust_box_crop, disabled by default.
+- At eval time only, suspicious ref/tar boxes are replaced for crop computation using neighboring clean boxes from the same 6-frame annotation sequence.
+- GT, anno_id, img_path, original annotations are not modified.
+
+Thresholds tested:
+- robust_box_occ_thresh = 0.3
+- robust_box_area_ratio_thresh = 1.8
+- robust_box_height_ratio_thresh = 1.6
+- robust_box_center_shift_thresh = 0.0
+
+Baseline current best:
+- Average RTE: ~10.420%
+- ttc -20~0: ~12.01%
+- ttc 0~3: ~5.51%
+- ttc 3~6: ~7.13%
+- ttc 6~20: ~11.63%
+
+Full eval with robust box crop enabled:
+- Average RTE: 11.293111%
+- Average RSE: 13.863567
+- ttc -20~0: 12.34%
+- ttc 0~3: 8.33%
+- ttc 3~6: 8.69%
+- ttc 6~20: 12.08%
+
+Box-change coverage:
+- Changed samples: 300 / 29087 = 1.03%
+- ttc -20~0: 54 / 8561 = 0.63%
+- ttc 0~3: 44 / 3876 = 1.14%
+- ttc 3~6: 51 / 3958 = 1.29%
+- ttc 6~20: 144 / 12221 = 1.18%
+- out_of_range: 7 / 471 = 1.49%
+
+Changed-sample targeted inference:
+- Changed samples old mean RTE: 38.31%
+- Changed samples robust mean RTE: 122.93%
+- Improved: 71 samples
+- Worsened: 226 samples
+
+Large improvements observed:
+- idx 15934: 862.1% -> 36.4%
+- idx 27832: 789.8% -> 9.6%
+- idx 3930: 703.1% -> 42.7%
+- idx 9902: 384.6% -> 11.3%
+- idx 10530: 303.1% -> 11.8%
+
+Large regressions observed:
+- idx 16232: 0.1% -> 1044.4%
+- idx 16215: 5.2% -> 885.1%
+- idx 12547: 6.5% -> 870.8%
+- idx 28463: 1.0% -> 845.8%
+- idx 26358: 0.5% -> 776.4%
+
+Conclusion:
+Eval-only robust crop is not suitable for the current trained checkpoint. It can rescue some extreme annotation/crop outliers, but it changes the crop distribution for many samples that the current model already predicts well, especially in 0~3s and 3~6s, causing a net metric regression. Keep the feature disabled by default. If this direction is pursued, it should be used during training as a consistent preprocessing/augmentation policy, or converted into a conservative anomaly flag/sample weight rather than direct eval-time crop replacement.

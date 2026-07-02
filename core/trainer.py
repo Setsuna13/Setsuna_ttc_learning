@@ -184,7 +184,15 @@ class Trainer:
             return self.evaluate_and_save_model()
 
     def before_iter(self):
-        pass
+        self.apply_frozen_module_modes()
+
+    def apply_frozen_module_modes(self):
+        if not getattr(self.exp, "freeze_backbone", False):
+            return
+        model = self.model.module if is_parallel(self.model) else self.model
+        model.backbone.eval()
+        if getattr(self.exp, "unfreeze_multiscale_fusion", False):
+            model.backbone.multiscale_fusion.train()
 
     def after_iter(self):
         """

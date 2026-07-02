@@ -26,6 +26,33 @@ class TTCHead(nn.Module):
             normalize_similarity = True,
             similarity_topk_ratio = 0.05,
             similarity_topk_weight = 0.4,
+            use_per_bin_residual_head = False,
+            residual_bin_num = 31,
+            residual_scale_range = 0.03,
+            residual_loss_weight = 0.3,
+            final_scale_loss_weight = 0.5,
+            residual_short_loss_weight = 0.05,
+            residual_mid_ttc_abs_thresh = 3.0,
+            residual_mid_loss_weight = 0.3,
+            residual_long_ttc_abs_thresh = 6.0,
+            residual_long_loss_weight = 1.0,
+            residual_tail_ttc_abs_thresh = 12.0,
+            residual_tail_loss_weight = 1.2,
+            scale_bin_mode = "linear",
+            scale_bin_density_power = 2.5,
+            scale_bin_center = 1.0,
+            use_ttc_metric_loss = False,
+            ttc_metric_loss_weight = 1.0,
+            ttc_metric_clip = 20.0,
+            ttc_metric_min_denom = 1.0,
+            ttc_metric_huber_beta = 0.1,
+            ttc_metric_short_loss_weight = 0.02,
+            ttc_metric_mid_ttc_abs_thresh = 3.0,
+            ttc_metric_mid_loss_weight = 0.25,
+            ttc_metric_long_ttc_abs_thresh = 6.0,
+            ttc_metric_long_loss_weight = 1.0,
+            ttc_metric_tail_ttc_abs_thresh = 12.0,
+            ttc_metric_tail_loss_weight = 1.2,
             **kwargs
     ):
         super().__init__()
@@ -53,6 +80,37 @@ class TTCHead(nn.Module):
         self.similarity_topk_ratio = similarity_topk_ratio
         self.similarity_topk_weight = similarity_topk_weight
         self.ce_loss = nn.CrossEntropyLoss()
+        self.use_per_bin_residual_head = bool(use_per_bin_residual_head)
+        self.residual_bin_num = max(3, int(residual_bin_num))
+        self.residual_scale_range = max(float(residual_scale_range), 1e-6)
+        self.residual_loss_weight = float(residual_loss_weight)
+        self.final_scale_loss_weight = float(final_scale_loss_weight)
+        self.residual_short_loss_weight = float(residual_short_loss_weight)
+        self.residual_mid_ttc_abs_thresh = float(residual_mid_ttc_abs_thresh)
+        self.residual_mid_loss_weight = float(residual_mid_loss_weight)
+        self.residual_long_ttc_abs_thresh = float(residual_long_ttc_abs_thresh)
+        self.residual_long_loss_weight = float(residual_long_loss_weight)
+        self.residual_tail_ttc_abs_thresh = float(residual_tail_ttc_abs_thresh)
+        self.residual_tail_loss_weight = float(residual_tail_loss_weight)
+        self.scale_bin_mode = str(scale_bin_mode)
+        self.scale_bin_density_power = max(float(scale_bin_density_power), 1.0)
+        self.scale_bin_center = float(scale_bin_center)
+        self.use_ttc_metric_loss = bool(use_ttc_metric_loss)
+        self.ttc_metric_loss_weight = float(ttc_metric_loss_weight)
+        self.ttc_metric_clip = float(ttc_metric_clip)
+        self.ttc_metric_min_denom = max(float(ttc_metric_min_denom), 1e-6)
+        self.ttc_metric_huber_beta = max(float(ttc_metric_huber_beta), 1e-6)
+        self.ttc_metric_short_loss_weight = float(ttc_metric_short_loss_weight)
+        self.ttc_metric_mid_ttc_abs_thresh = float(ttc_metric_mid_ttc_abs_thresh)
+        self.ttc_metric_mid_loss_weight = float(ttc_metric_mid_loss_weight)
+        self.ttc_metric_long_ttc_abs_thresh = float(ttc_metric_long_ttc_abs_thresh)
+        self.ttc_metric_long_loss_weight = float(ttc_metric_long_loss_weight)
+        self.ttc_metric_tail_ttc_abs_thresh = float(ttc_metric_tail_ttc_abs_thresh)
+        self.ttc_metric_tail_loss_weight = float(ttc_metric_tail_loss_weight)
+        if self.use_per_bin_residual_head:
+            self.residual_preds = nn.Linear(scale_number, scale_number * self.residual_bin_num)
+            nn.init.zeros_(self.residual_preds.weight)
+            nn.init.zeros_(self.residual_preds.bias)
 
     def forward(self, xin, tar_boxes,ref_boxes,ttc_imu =None,**kwargs):
         '''
@@ -99,6 +157,11 @@ class TTCHead(nn.Module):
             simlarities_scale = torch.max(simlarities_scale.view([-1,self.scale_number, self.shift_kernel_size ** 2]), dim=-1).values
 
         predictions = self.scale_preds(simlarities_scale)
+        residual_logits = None
+        if self.use_per_bin_residual_head and self.head_type == "distribution":
+            residual_logits = self.residual_preds(simlarities_scale).view(
+                -1, self.scale_number, self.residual_bin_num
+            )
         if self.training:
             if self.head_type == "distribution":
                 if 'dictAnnos' in kwargs:
@@ -106,7 +169,34 @@ class TTCHead(nn.Module):
                 else:
                     frame_gap = self.sequence_len - 1
                 gt_scales = self.prepare_targets(ttc_imu, frame_gap).type_as(predictions)
-                return self.get_distribution_loss(predictions, gt_scales, scale_list)
+                distribution_loss = self.get_distribution_loss(predictions, gt_scales, scale_list)
+                total_loss = distribution_loss
+                pred_scales = None
+                base_probs = None
+                if self.use_per_bin_residual_head:
+                    pred_scales, base_probs = self.apply_per_bin_residual(
+                        predictions, residual_logits, scale_list
+                    )
+                    sample_weights = self.get_residual_sample_weights(
+                        ttc_imu, predictions.device, predictions.dtype
+                    )
+                    residual_loss = self.get_per_bin_residual_loss(
+                        residual_logits, gt_scales, scale_list, base_probs.detach(), sample_weights
+                    )
+                    final_scale_loss = self.get_weighted_scale_loss(
+                        pred_scales, gt_scales, sample_weights
+                    )
+                    total_loss = (
+                        total_loss
+                        + self.residual_loss_weight * residual_loss
+                        + self.final_scale_loss_weight * final_scale_loss
+                    )
+                if self.use_ttc_metric_loss:
+                    if pred_scales is None:
+                        pred_scales, base_probs = self.apply_distribution_prediction(predictions, scale_list)
+                    metric_loss = self.get_ttc_metric_loss(pred_scales, ttc_imu, frame_gap)
+                    total_loss = total_loss + self.ttc_metric_loss_weight * metric_loss
+                return total_loss
 
             predictions = predictions.view(-1,1)
             if 'dictAnnos' in kwargs:
@@ -118,7 +208,11 @@ class TTCHead(nn.Module):
             scale_loss = self.get_loss(predictions, gt_one_hot)
             return scale_loss
         if self.head_type == "distribution":
-            return F.softmax(predictions, dim=-1), scale_list, None
+            base_probs = F.softmax(predictions, dim=-1)
+            if self.use_per_bin_residual_head:
+                pred_scales, _ = self.apply_per_bin_residual(predictions, residual_logits, scale_list)
+                return base_probs, scale_list, pred_scales
+            return base_probs, scale_list, None
         return predictions.sigmoid(), scale_list, None
 
     def shift_split(self,ref_features):
@@ -157,18 +251,158 @@ class TTCHead(nn.Module):
         return torch.tensor(scale_gt)
 
     def get_distribution_loss(self, logits, gt_scales, scale_list):
-        step = (self.max_scale - self.min_scale) / (self.scale_number - 1)
-        float_idx = ((gt_scales - self.min_scale) / step).clamp(0, self.scale_number - 1)
+        scale_list = scale_list.to(device=logits.device, dtype=logits.dtype)
+        gt_scales = gt_scales.to(device=logits.device, dtype=logits.dtype).view(-1)
+        gt_scales = gt_scales.clamp(scale_list[0], scale_list[-1])
 
-        idx_l = float_idx.floor().long().clamp(0, self.scale_number - 1)
-        idx_r = float_idx.ceil().long().clamp(0, self.scale_number - 1)
-        weight_r = float_idx - idx_l
+        idx_r = torch.searchsorted(scale_list, gt_scales, right=False).clamp(1, self.scale_number - 1)
+        idx_l = (idx_r - 1).clamp(0, self.scale_number - 1)
+        scale_l = scale_list[idx_l]
+        scale_r = scale_list[idx_r]
+        weight_r = (gt_scales - scale_l) / (scale_r - scale_l).clamp_min(1e-12)
+        weight_r = weight_r.clamp(0.0, 1.0)
         weight_l = 1.0 - weight_r
 
         log_probs = F.log_softmax(logits, dim=-1)
         loss_l = F.nll_loss(log_probs, idx_l, reduction="none")
         loss_r = F.nll_loss(log_probs, idx_r, reduction="none")
         return (loss_l * weight_l + loss_r * weight_r).mean()
+
+    def apply_distribution_prediction(self, logits, scale_list):
+        scale_list = scale_list.to(device=logits.device, dtype=logits.dtype)
+        probs = F.softmax(logits, dim=-1)
+        pred_scales = torch.sum(probs * scale_list.view(1, -1), dim=-1)
+        return pred_scales, probs
+
+    def get_fps_tensor(self, frame_gap, reference):
+        if isinstance(frame_gap, (list, tuple)):
+            gap = torch.as_tensor(frame_gap, dtype=reference.dtype, device=reference.device).view(-1)
+        elif torch.is_tensor(frame_gap):
+            gap = frame_gap.to(device=reference.device, dtype=reference.dtype).view(-1)
+        else:
+            gap = torch.full_like(reference.view(-1), float(frame_gap))
+        if gap.numel() == 1 and reference.numel() != 1:
+            gap = gap.expand(reference.numel())
+        gap = gap.clamp_min(1.0)
+        return 10.0 / gap
+
+    def get_ttc_metric_sample_weights(self, gt_ttcs, device, dtype):
+        gt_abs = torch.as_tensor(gt_ttcs, device=device, dtype=dtype).view(-1).abs()
+        weights = torch.full_like(gt_abs, self.ttc_metric_short_loss_weight)
+        weights = torch.where(
+            gt_abs >= self.ttc_metric_mid_ttc_abs_thresh,
+            torch.full_like(weights, self.ttc_metric_mid_loss_weight),
+            weights,
+        )
+        weights = torch.where(
+            gt_abs >= self.ttc_metric_long_ttc_abs_thresh,
+            torch.full_like(weights, self.ttc_metric_long_loss_weight),
+            weights,
+        )
+        if self.ttc_metric_tail_ttc_abs_thresh > 0:
+            weights = torch.where(
+                gt_abs >= self.ttc_metric_tail_ttc_abs_thresh,
+                torch.full_like(weights, self.ttc_metric_tail_loss_weight),
+                weights,
+            )
+        return weights
+
+    def get_ttc_metric_loss(self, pred_scales, gt_ttcs, frame_gap):
+        pred_scales = pred_scales.view(-1).clamp_min(1e-6)
+        gt_ttcs = torch.as_tensor(gt_ttcs, device=pred_scales.device, dtype=pred_scales.dtype).view(-1)
+        fps = self.get_fps_tensor(frame_gap, pred_scales)
+        pred_ttcs = scale_ratio_to_ttc(pred_scales, fps=fps)
+        pred_ttcs = pred_ttcs.clamp(-self.ttc_metric_clip, self.ttc_metric_clip)
+        gt_ttcs = gt_ttcs.clamp(-self.ttc_metric_clip, self.ttc_metric_clip)
+        denom = gt_ttcs.abs().clamp_min(self.ttc_metric_min_denom)
+        rel_delta = (pred_ttcs - gt_ttcs) / denom
+        abs_delta = rel_delta.abs()
+        beta = self.ttc_metric_huber_beta
+        loss = torch.where(
+            abs_delta < beta,
+            0.5 * abs_delta.pow(2) / beta,
+            abs_delta - 0.5 * beta,
+        )
+        weights = self.get_ttc_metric_sample_weights(gt_ttcs, pred_scales.device, pred_scales.dtype)
+        return (loss * weights).sum() / weights.sum().clamp_min(1e-12)
+
+    def get_residual_list(self, device=None, dtype=None):
+        return torch.linspace(
+            -self.residual_scale_range,
+            self.residual_scale_range,
+            self.residual_bin_num,
+            device=device,
+            dtype=dtype,
+        )
+
+    def apply_per_bin_residual(self, base_logits, residual_logits, scale_list):
+        scale_list = scale_list.to(device=base_logits.device, dtype=base_logits.dtype)
+        residual_list = self.get_residual_list(base_logits.device, base_logits.dtype)
+        base_probs = F.softmax(base_logits, dim=-1)
+        residual_probs = F.softmax(residual_logits, dim=-1)
+        corrected_scales = scale_list.view(1, -1, 1) + residual_list.view(1, 1, -1)
+        corrected_scales = corrected_scales.clamp_min(1e-6)
+        pred_scales = (base_probs.unsqueeze(-1) * residual_probs * corrected_scales).sum(dim=(1, 2))
+        return pred_scales, base_probs
+
+    def get_residual_sample_weights(self, gt_ttcs, device, dtype):
+        if gt_ttcs is None:
+            return torch.ones(1, device=device, dtype=dtype)
+        gt_abs = torch.as_tensor(gt_ttcs, device=device, dtype=dtype).view(-1).abs()
+        weights = torch.full_like(gt_abs, self.residual_short_loss_weight)
+        weights = torch.where(
+            gt_abs >= self.residual_mid_ttc_abs_thresh,
+            torch.full_like(weights, self.residual_mid_loss_weight),
+            weights,
+        )
+        weights = torch.where(
+            gt_abs >= self.residual_long_ttc_abs_thresh,
+            torch.full_like(weights, self.residual_long_loss_weight),
+            weights,
+        )
+        if self.residual_tail_ttc_abs_thresh > 0:
+            weights = torch.where(
+                gt_abs >= self.residual_tail_ttc_abs_thresh,
+                torch.full_like(weights, self.residual_tail_loss_weight),
+                weights,
+            )
+        return weights
+
+    def get_weighted_scale_loss(self, pred_scales, gt_scales, sample_weights):
+        pred_scales = pred_scales.view(-1)
+        gt_scales = gt_scales.to(device=pred_scales.device, dtype=pred_scales.dtype).view(-1)
+        sample_weights = sample_weights.to(device=pred_scales.device, dtype=pred_scales.dtype).view(-1)
+        scale_step = max((self.max_scale - self.min_scale) / max(self.scale_number - 1, 1), 1e-6)
+        loss = torch.abs(pred_scales - gt_scales) / scale_step
+        return (loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-12)
+
+    def get_per_bin_residual_loss(self, residual_logits, gt_scales, scale_list, bin_weights, sample_weights=None):
+        scale_list = scale_list.to(device=residual_logits.device, dtype=residual_logits.dtype)
+        gt_scales = gt_scales.to(device=residual_logits.device, dtype=residual_logits.dtype).view(-1, 1)
+        bin_weights = bin_weights.to(device=residual_logits.device, dtype=residual_logits.dtype)
+        if sample_weights is None:
+            sample_weights = torch.ones(gt_scales.shape[0], device=residual_logits.device, dtype=residual_logits.dtype)
+        else:
+            sample_weights = sample_weights.to(device=residual_logits.device, dtype=residual_logits.dtype).view(-1)
+
+        residual_targets = (gt_scales - scale_list.view(1, -1)).clamp(
+            -self.residual_scale_range, self.residual_scale_range
+        )
+        step = (2.0 * self.residual_scale_range) / (self.residual_bin_num - 1)
+        float_idx = ((residual_targets + self.residual_scale_range) / step).clamp(
+            0, self.residual_bin_num - 1
+        )
+        idx_l = float_idx.floor().long().clamp(0, self.residual_bin_num - 1)
+        idx_r = float_idx.ceil().long().clamp(0, self.residual_bin_num - 1)
+        weight_r = float_idx - idx_l
+        weight_l = 1.0 - weight_r
+
+        log_probs = F.log_softmax(residual_logits, dim=-1).reshape(-1, self.residual_bin_num)
+        loss_l = F.nll_loss(log_probs, idx_l.reshape(-1), reduction="none").view_as(float_idx)
+        loss_r = F.nll_loss(log_probs, idx_r.reshape(-1), reduction="none").view_as(float_idx)
+        residual_loss = loss_l * weight_l + loss_r * weight_r
+        weights = bin_weights * sample_weights.view(-1, 1)
+        return (residual_loss * weights).sum() / weights.sum().clamp_min(1e-12)
 
     def gt_to_one_hot(self, gts, gap, scale_list):
         if type(gap) is list:
@@ -192,7 +426,33 @@ class TTCHead(nn.Module):
         return gt_one_hot
 
     def get_scale_list(self, S):
-        return torch.linspace(self.min_scale, self.max_scale, S)
+        mode = self.scale_bin_mode.lower()
+        if mode in ("linear", "uniform"):
+            return torch.linspace(self.min_scale, self.max_scale, S)
+        if mode in ("center_dense", "ttc_aware", "ttc_aware_center_dense"):
+            return self.get_center_dense_scale_list(S)
+        raise ValueError("Unsupported scale_bin_mode: {}".format(self.scale_bin_mode))
+
+    def get_center_dense_scale_list(self, S):
+        if S <= 2:
+            return torch.linspace(self.min_scale, self.max_scale, S)
+        center = min(max(self.scale_bin_center, self.min_scale + 1e-6), self.max_scale - 1e-6)
+        left_range = center - self.min_scale
+        right_range = self.max_scale - center
+        total_range = left_range + right_range
+        if left_range <= 0 or right_range <= 0 or total_range <= 0:
+            return torch.linspace(self.min_scale, self.max_scale, S)
+
+        left_bins = int(round((S - 1) * left_range / total_range)) + 1
+        left_bins = min(max(left_bins, 2), S - 1)
+        right_bins = S - left_bins + 1
+        power = self.scale_bin_density_power
+
+        left_u = torch.linspace(0.0, 1.0, left_bins)
+        right_u = torch.linspace(0.0, 1.0, right_bins)
+        left = center - left_range * torch.pow(1.0 - left_u, power)
+        right = center + right_range * torch.pow(right_u, power)
+        return torch.cat([left, right[1:]], dim=0)
 
     def boxes_sample(self,ref_boxes,tar_boxes,scale_list,H=576,W=1024):
         '''

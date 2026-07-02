@@ -1,0 +1,25 @@
+Current best prediction export
+================================
+checkpoint: /home/zzqh/TTC/TSTTC/TTC_outputs/head+multi/best_ckpt.pth
+checkpoint_best_rte: 10.420398035190447
+checkpoint_start_epoch: 36
+num_samples: 29087
+average_relative_ttc_error_pct: 10.420469
+average_abs_ttc_error: 1.507214
+average_inference_time_per_batch: 0.100254
+elapsed_seconds: 907.74
+
+Per-bin summary
+---------------
+ttc -20~0: n=8561, avg_rel_ttc_error_pct=12.013414, avg_abs_ttc_error=1.847784
+ttc 0~3: n=3876, avg_rel_ttc_error_pct=5.509859, avg_abs_ttc_error=0.113336
+ttc 3~6: n=3958, avg_rel_ttc_error_pct=7.131709, avg_abs_ttc_error=0.361035
+ttc 6~20: n=12221, avg_rel_ttc_error_pct=11.634222, avg_abs_ttc_error=1.977147
+out_of_range: n=471, avg_rel_ttc_error_pct=18.021225, avg_abs_ttc_error=4.226063
+
+Columns
+-------
+gt_ttc: validation ground-truth TTC
+pred_ttc: model predicted TTC from predicted scale
+rel_ttc_error_pct: abs(clamp(pred)-clamp(gt))/abs(clamp(gt))*100
+gt_scale/pred_scale: scale ratios using per-sample frame_gap fps

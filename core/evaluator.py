@@ -43,6 +43,8 @@ class TTCEvaluator:
         for cur_iter, (imgs, annos, candidate_boxes, ttc_gts_tensor) in enumerate(
                 progress_bar(self.dataloader)
         ):
+            if imgs is None or candidate_boxes is None or ttc_gts_tensor is None:
+                continue
             with torch.inference_mode():
                 imgs = imgs.type(tensor_type)
                 if torch.is_tensor(candidate_boxes):
@@ -105,6 +107,10 @@ class TTCEvaluator:
             scale_error_list = list(itertools.chain(*scale_error_list))
             analysis_list = list(itertools.chain(*analysis_list))
 
+
+        if not analysis_list:
+            synchronize()
+            return 0.0, 0.0, "No valid samples were found during evaluation.\n", {}
 
         summary,scale_error_dict = self.log_error(self.cal_error(analysis_list))
         summary += '-----------------------------\n'

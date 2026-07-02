@@ -99,9 +99,16 @@ def make_parser():
     )
     parser.add_argument(
         "--box_level",
-        help="use whole imgae for inference or not",
+        dest="box_level",
+        help="use cropped box images for inference",
         action="store_true",
         default=True,
+    )
+    parser.add_argument(
+        "--whole_img",
+        dest="box_level",
+        help="use whole images for inference",
+        action="store_false",
     )
 
     return parser

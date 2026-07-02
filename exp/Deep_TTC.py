@@ -322,7 +322,7 @@ class Exp(BaseExp):
         valdataset = TSTTCDataset(**valArgs)
         self._check_non_empty_dataset(valdataset, "val")
         if is_distributed:
-            batch_size = batch_size // dist.get_world_size()
+            batch_size = max(1, batch_size // dist.get_world_size())
         dataset = get_ttc_loader(batch_size, data_num_workers=self.data_num_workers,
                                  dataset=valdataset, is_dist=is_distributed, seed=self.seed)
         return dataset
@@ -366,7 +366,7 @@ class Exp(BaseExp):
             dataset = TSTTCDataset(**trainArgs)
             self._check_non_empty_dataset(dataset, "train")
             if is_distributed:
-                batch_size = batch_size // dist.get_world_size()
+                batch_size = max(1, batch_size // dist.get_world_size())
         ttc_train_loader = get_ttc_loader(batch_size, data_num_workers=self.data_num_workers, dataset=dataset,
                                           is_dist=is_distributed)
         return ttc_train_loader

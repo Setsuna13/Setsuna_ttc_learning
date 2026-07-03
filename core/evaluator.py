@@ -26,6 +26,7 @@ class TTCEvaluator:
         self.sequence_len = sequence_len
         self.scale_number = scale_number
         self.fps = fps
+        self.mid_fps = 10.0
         self.ttc_range = [-20,0,3,6,20]
 
     def evaluate(self, model, is_distributed=False, half=False,topk=4):
@@ -33,7 +34,7 @@ class TTCEvaluator:
         model = model.eval()
         if half:
             model = model.half()
-        ttc_error_list, scale_error_list = [], []
+        ttc_error_list, mid_error_list = [], []
         analysis_list = []
         result_dict = {}
         progress_bar = tqdm if is_main_process() else iter
@@ -85,26 +86,26 @@ class TTCEvaluator:
 
                 pred_ttcs_eval = pred_ttcs.detach().float().cpu()
                 ttc_gt_eval = ttc_gt.detach().float().cpu()
-                scale_gt = ttc_to_scale_ratio(ttc_gt_eval, self.fps)
+                scale_gt = ttc_to_scale_ratio(ttc_gt_eval, self.mid_fps)
                 pred_ttc_list = pred_ttcs_eval.numpy().tolist()
                 ave_ttc_errors, tmp_ttc, ttcs_abs_error = self.compute_error_rate(pred_ttcs_eval, ttc_gt_eval,mid=False)
-                ave_scale_errors, tmp_scale, scale_abs_error = self.compute_error_rate(pred_ttcs_eval, ttc_gt_eval,mid=True)
+                ave_mid_errors, tmp_mid, scale_abs_error = self.compute_error_rate(pred_ttcs_eval, ttc_gt_eval,mid=True)
 
-                for box_id, contents in enumerate(zip(annos['metaAnnos'], tmp_ttc, tmp_scale, ttcs_abs_error, scale_abs_error,pred_ttc_list)):
-                    raw_obj, ttc_rel, scale_rel, ttc_abs, scale_abs,pred_ttc = contents
+                for box_id, contents in enumerate(zip(annos['metaAnnos'], tmp_ttc, tmp_mid, ttcs_abs_error, scale_abs_error,pred_ttc_list)):
+                    raw_obj, ttc_rel, mid, ttc_abs, scale_abs,pred_ttc = contents
                     result_dict[raw_obj.anno_id] = pred_ttc
                     analysis_list.append(np.array(
-                        [ttc_rel, ttc_abs, scale_rel, scale_abs, float(ttc_gt_eval[box_id]), float(scale_gt[box_id])]
+                        [ttc_rel, ttc_abs, mid, scale_abs, float(ttc_gt_eval[box_id]), float(scale_gt[box_id])]
                     ))
                 ttc_error_list.extend(tmp_ttc)
-                scale_error_list.extend(tmp_scale)
+                mid_error_list.extend(tmp_mid)
                 
         if is_distributed:
             ttc_error_list = gather(ttc_error_list, dst=0)
-            scale_error_list = gather(scale_error_list, dst=0)
+            mid_error_list = gather(mid_error_list, dst=0)
             analysis_list = gather(analysis_list, dst=0)
             ttc_error_list = list(itertools.chain(*ttc_error_list))
-            scale_error_list = list(itertools.chain(*scale_error_list))
+            mid_error_list = list(itertools.chain(*mid_error_list))
             analysis_list = list(itertools.chain(*analysis_list))
 
 
@@ -112,11 +113,11 @@ class TTCEvaluator:
             synchronize()
             return 0.0, 0.0, "No valid samples were found during evaluation.\n", {}
 
-        summary,scale_error_dict = self.log_error(self.cal_error(analysis_list))
+        summary,mid_error_dict = self.log_error(self.cal_error(analysis_list))
         summary += '-----------------------------\n'
         summary += 'Ave inference time: %.4f' % float(inference_time / n_samples) + '\n'
         synchronize()
-        return sum(ttc_error_list) / max(len(ttc_error_list),1), sum(scale_error_list) / max(len(scale_error_list),1),summary,scale_error_dict
+        return sum(ttc_error_list) / max(len(ttc_error_list),1), sum(mid_error_list) / max(len(mid_error_list),1),summary,mid_error_dict
 
 
     def compute_error_rate(self, pred, gt, mid = False):
@@ -134,8 +135,8 @@ class TTCEvaluator:
         for i in range(pred.shape[0]):
             if mid:
                 pred_ttc = max(min(pred[i], 20), -20)
-                pred_tmp = ttc_to_scale_ratio(pred_ttc, self.fps)
-                gt_tmp = ttc_to_scale_ratio(gt[i], self.fps)
+                pred_tmp = ttc_to_scale_ratio(pred_ttc, self.mid_fps)
+                gt_tmp = ttc_to_scale_ratio(gt[i], self.mid_fps)
                 error = float(abs(math.log(pred_tmp) - math.log(gt_tmp)) * 10**4)
             else:
                 pred_tmp = max(min(pred[i], 20), -20)
@@ -177,18 +178,18 @@ class TTCEvaluator:
 
         name_list = ['ttc']
         summary = ''
-        scale_error_dict = {}
+        mid_error_dict = {}
         for result_dic, name in zip(result_list, name_list):
             key_list, value_list = [], []
             for key in list(result_dic.keys()):
                 summary += '-----------------------------\n'
                 summary += key + ":\n"
                 if 'ttc' in key:
-                    scale_error_dict[key] = 0
+                    mid_error_dict[key] = 0
                 data = result_dic[key]
                 ttc_error_relative = np.abs(data[:, 0])
                 ttc_error_abs = data[:, 1]
-                scale_error_relative = data[:, 2]
+                mid_error = data[:, 2]
                 scale_error_abs = data[:, 3]
                 counts = int(ttc_error_abs.shape[0])
                 key_list.append(key)
@@ -197,13 +198,13 @@ class TTCEvaluator:
                     summary += 'total sample number: %i' % (counts) + '\n'
                     summary +='Ave relative ttc error: %.2f %%' % float(np.average(ttc_error_relative))+ '\n'
                     summary +='Ave abs ttc error: %.2f' % float(np.average(ttc_error_abs))+ '\n'
-                    summary +='Ave motion in depth: %.4f %%' % float(np.average(scale_error_relative))+ '\n'
-                    summary +='Ave abs scale error: %.4f' % float(np.average(scale_error_abs))+ '\n'
+                    summary +='Ave MiD: %.4f' % float(np.average(mid_error))+ '\n'
+                    summary +='Ave abs scale-ratio error: %.4f' % float(np.average(scale_error_abs))+ '\n'
 
                     if 'ttc' in key:
-                        scale_error_dict[key] = float(np.average(scale_error_relative))
+                        mid_error_dict[key] = float(np.average(mid_error))
                     value_list[-1] = counts
                 else:
                     summary +='No samples in this key'+ '\n'
 
-        return summary,scale_error_dict
+        return summary,mid_error_dict

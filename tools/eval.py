@@ -155,10 +155,10 @@ def main(exp, args, num_gpu):
     logger.info("loaded checkpoint done.")
     if is_distributed:
         model = DDP(model, device_ids=[rank])
-    rte, rse, summary,_ = exp.eval(
+    rte, mid, summary,_ = exp.eval(
         model,evaluator,is_distributed,half=args.fp16
     )
-    logger.info('Average RSE:{}, Average RTE:{}'.format(rse, rte))
+    logger.info('Average MiD:{}, Average RTE:{}'.format(mid, rte))
     logger.info(summary)
 
 

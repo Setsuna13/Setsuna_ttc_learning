@@ -275,7 +275,7 @@ class Trainer:
         if is_parallel(evalmodel):
             evalmodel = evalmodel.module
         with adjust_status(evalmodel, training=False):
-            rte, rse, summary, scale_error_dict = self.exp.eval(
+            rte, mid, summary, mid_error_dict = self.exp.eval(
                 evalmodel, self.evaluator, self.is_distributed
             )
 
@@ -285,17 +285,17 @@ class Trainer:
         if self.rank == 0:
             if self.args.logger == "tensorboard":
                 self.tblogger.add_scalar("val/RTE", rte, self.epoch + 1)
-                self.tblogger.add_scalar("val/MiD", rse, self.epoch + 1)
-                for tmp_key in list(scale_error_dict.keys()):
-                    self.tblogger.add_scalar(tmp_key, scale_error_dict[tmp_key], self.epoch + 1)
-            logger.info('Average MiD:{}, Average RTE:{}'.format(rse, rte))
+                self.tblogger.add_scalar("val/MiD", mid, self.epoch + 1)
+                for tmp_key in list(mid_error_dict.keys()):
+                    self.tblogger.add_scalar("val/MiD/" + tmp_key, mid_error_dict[tmp_key], self.epoch + 1)
+            logger.info('Average MiD:{}, Average RTE:{}'.format(mid, rte))
             logger.info(summary)
         synchronize()
 
         self.save_ckpt("last_epoch", update_best_ckpt)
         if self.save_history_ckpt:
             self.save_ckpt(f"epoch_{self.epoch + 1}")
-        return rse,summary
+        return mid,summary
 
     def save_ckpt(self, ckpt_name, update_best_ckpt=False):
         if self.rank == 0:

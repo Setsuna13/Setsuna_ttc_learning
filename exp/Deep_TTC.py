@@ -32,6 +32,13 @@ class Exp(BaseExp):
         self.width = 1.00
         # activation name. For example, if using "relu", then "silu" will be replaced to "relu".
         self.act = "silu"
+        # encoder switch: "ttcbase" keeps the original baseline, "resnet50" uses a pretrained ResNet-50.
+        self.backbone_type = "ttcbase"
+        self.resnet50_pretrained = True
+        self.resnet50_weights_path = ""
+        self.resnet50_out_stage = "layer2"
+        self.resnet50_out_channels = 24
+        self.resnet50_trainable = True
         # scale number
         self.scale_num = 50
         # ttc bin or scale bin
@@ -165,24 +172,38 @@ class Exp(BaseExp):
         self.test_size = (576, 1024)
 
     def get_model(self):
-        from model.backbone import TTCBase
+        from model.backbone import TTCBase, ResNet50Encoder
         from model.ttc_head import TTCHead
         from model.TTCNet import TTCNet
 
-        backbone = TTCBase(
-            dep_mul=self.depth,
-            wid_mul=self.width,
-            kszie=self.ksize_base,
-            act=self.act,
-            use_multiscale_fusion=self.use_backbone_multiscale_fusion,
-            multiscale_pool_kernel_sizes=self.multiscale_pool_kernel_sizes,
-            use_ms_detail_branch=self.use_ms_detail_branch,
-            use_ms_context_branches=self.use_ms_context_branches,
-            use_ms_global_branch=self.use_ms_global_branch,
-            use_ms_channel_gate=self.use_ms_channel_gate,
-            use_ms_spatial_gate=self.use_ms_spatial_gate,
-        )
-        head_in_channel = int(self.width * 12) * 2
+        backbone_type = str(self.backbone_type).lower()
+        if backbone_type in ("resnet50", "resnet"):
+            backbone = ResNet50Encoder(
+                out_stage=self.resnet50_out_stage,
+                out_channels=self.resnet50_out_channels,
+                pretrained=self.resnet50_pretrained,
+                weights_path=self.resnet50_weights_path,
+                trainable=self.resnet50_trainable,
+                act=self.act,
+            )
+            head_in_channel = backbone.output_channels
+        elif backbone_type in ("ttcbase", "baseline"):
+            backbone = TTCBase(
+                dep_mul=self.depth,
+                wid_mul=self.width,
+                kszie=self.ksize_base,
+                act=self.act,
+                use_multiscale_fusion=self.use_backbone_multiscale_fusion,
+                multiscale_pool_kernel_sizes=self.multiscale_pool_kernel_sizes,
+                use_ms_detail_branch=self.use_ms_detail_branch,
+                use_ms_context_branches=self.use_ms_context_branches,
+                use_ms_global_branch=self.use_ms_global_branch,
+                use_ms_channel_gate=self.use_ms_channel_gate,
+                use_ms_spatial_gate=self.use_ms_spatial_gate,
+            )
+            head_in_channel = int(self.width * 12) * 2
+        else:
+            raise ValueError("Unsupported backbone_type: %s" % self.backbone_type)
         head = TTCHead(scale_number=self.scale_num, width=self.width,
                        in_channel=head_in_channel,
                        fps=10 / (self.sequence_len - 1), ttc_bin=self.ttc_bin, min_scale=self.min_scale,

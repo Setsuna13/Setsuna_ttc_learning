@@ -214,3 +214,96 @@ class TTCBase(nn.Module):
         if self.use_multiscale_fusion:
             x = self.multiscale_fusion(outputs["stem"], outputs["stage2"], x)
         return x#{k: v for k, v in outputs.items() if k in self.out_features}
+
+class ResNet50Encoder(nn.Module):
+    """Switchable ImageNet-pretrained ResNet50 encoder for TTC experiments."""
+
+    _STAGE_CHANNELS = {
+        "layer1": 256,
+        "layer2": 512,
+        "layer3": 1024,
+        "layer4": 2048,
+    }
+
+    def __init__(
+            self,
+            out_stage="layer2",
+            out_channels=24,
+            pretrained=True,
+            weights_path="",
+            trainable=True,
+            act="silu",
+    ):
+        super().__init__()
+        if out_stage not in self._STAGE_CHANNELS:
+            raise ValueError("out_stage must be one of %s, got %s" % (sorted(self._STAGE_CHANNELS), out_stage))
+
+        backbone = self._build_resnet50(pretrained=pretrained and not weights_path)
+        if weights_path:
+            self._load_weights(backbone, weights_path)
+
+        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+        self.out_stage = out_stage
+        self.output_channels = int(out_channels)
+
+        stage_channels = self._STAGE_CHANNELS[out_stage]
+        self.proj = (
+            nn.Identity()
+            if stage_channels == self.output_channels
+            else BaseConv(stage_channels, self.output_channels, 1, 1, act=act)
+        )
+
+        if not trainable:
+            for module in [self.stem, self.layer1, self.layer2, self.layer3, self.layer4]:
+                for param in module.parameters():
+                    param.requires_grad = False
+
+    @staticmethod
+    def _build_resnet50(pretrained=True):
+        from torchvision.models import resnet50
+        if not pretrained:
+            try:
+                return resnet50(weights=None)
+            except TypeError:
+                return resnet50(pretrained=False)
+        try:
+            from torchvision.models import ResNet50_Weights
+            return resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        except (ImportError, AttributeError, TypeError):
+            return resnet50(pretrained=True)
+
+    @staticmethod
+    def _load_weights(model, weights_path):
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict):
+            for key in ("state_dict", "model"):
+                if key in state and isinstance(state[key], dict):
+                    state = state[key]
+                    break
+        cleaned = {}
+        for key, value in state.items():
+            if key.startswith("module."):
+                key = key[len("module."):]
+            if key.startswith("backbone."):
+                key = key[len("backbone."):]
+            cleaned[key] = value
+        model.load_state_dict(cleaned, strict=False)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        if self.out_stage == "layer1":
+            return self.proj(x)
+        x = self.layer2(x)
+        if self.out_stage == "layer2":
+            return self.proj(x)
+        x = self.layer3(x)
+        if self.out_stage == "layer3":
+            return self.proj(x)
+        x = self.layer4(x)
+        return self.proj(x)
+

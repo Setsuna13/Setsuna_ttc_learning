@@ -68,14 +68,20 @@ def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
     k = head.k_proj(pair_tokens)
     v = head.v_proj(pair_tokens)
 
-    attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(max(head.attn_dim, 1))
+    q = head.split_attention_heads(q)
+    k = head.split_attention_heads(k)
+    v = head.split_attention_heads(v)
+
+    attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(max(head.cross_attention_head_dim, 1))
     attn_logits = attn_logits * head.attn_logit_scale.exp().clamp(max=10.0)
-    attn = F.softmax(attn_logits, dim=-1)
-    context = torch.matmul(attn, v)
+    attn_heads = F.softmax(attn_logits, dim=-1)
+    context = torch.matmul(attn_heads, v)
+    context = head.merge_attention_heads(context)
     scale_states = head.context_norm(scale_queries + head.out_proj(context))
     logits = head.pred_head(scale_states).squeeze(-1)
 
     token_count = attn_grid * attn_grid
+    attn = attn_heads.mean(dim=1)
     ref_attn = attn[..., :token_count]
     tar_attn = attn[..., token_count:]
     return {
@@ -83,6 +89,7 @@ def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
         "prob": F.softmax(logits, dim=-1),
         "scale_list": scale_list,
         "attn": attn,
+        "attn_heads": attn_heads,
         "ref_attn": ref_attn,
         "tar_attn": tar_attn,
         "attn_grid": attn_grid,
@@ -185,6 +192,7 @@ def main():
             np.savez_compressed(
                 npz_path,
                 attn=attn,
+                attn_heads=tensor_to_cpu(debug["attn_heads"][i]),
                 ref_attn=ref_attn,
                 tar_attn=tar_attn,
                 logits=logits,

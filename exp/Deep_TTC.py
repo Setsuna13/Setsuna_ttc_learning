@@ -77,8 +77,11 @@ class Exp(BaseExp):
         self.similarity_topk_weight = 0.0
         # direct cross-attention TTC head: predicts scale/TTC logits without per-scale ROI Align enumeration
         self.use_cross_attention_head = True
-        self.cross_attention_grid_size = 16
+        self.cross_attention_grid_size = 32
         self.cross_attention_position_sigma = 0.35
+        self.cross_attention_heads = 4
+        # 0 means use the backbone channel count; set 64/128 to increase head capacity.
+        self.cross_attention_dim = 0
 
         # ---------------- dataloader config ---------------- #
         # set worker to 8 for shorter dataloader init time
@@ -216,7 +219,9 @@ class Exp(BaseExp):
                        similarity_topk_weight=self.similarity_topk_weight,
                        use_cross_attention=self.use_cross_attention_head,
                        cross_attention_grid_size=self.cross_attention_grid_size,
-                       cross_attention_position_sigma=self.cross_attention_position_sigma)
+                       cross_attention_position_sigma=self.cross_attention_position_sigma,
+                       cross_attention_dim=(self.cross_attention_dim if self.cross_attention_dim > 0 else None),
+                       cross_attention_heads=self.cross_attention_heads)
 
         def init_model(M):
             for m in M.modules():

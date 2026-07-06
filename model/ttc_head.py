@@ -30,6 +30,7 @@ class TTCHead(nn.Module):
             cross_attention_grid_size = 16,
             cross_attention_position_sigma = 0.35,
             cross_attention_dim = None,
+            cross_attention_heads = 4,
             **kwargs
     ):
         super().__init__()
@@ -68,7 +69,17 @@ class TTCHead(nn.Module):
         )
 
         attn_dim = cross_attention_dim or in_channel
+        cross_attention_heads = int(cross_attention_heads)
+        if cross_attention_heads < 1:
+            raise ValueError("cross_attention_heads must be >= 1.")
+        if attn_dim % cross_attention_heads != 0:
+            raise ValueError(
+                "cross_attention_dim/in_channel (%d) must be divisible by cross_attention_heads (%d)."
+                % (attn_dim, cross_attention_heads)
+            )
         self.attn_dim = attn_dim
+        self.cross_attention_heads = cross_attention_heads
+        self.cross_attention_head_dim = attn_dim // cross_attention_heads
         self.ref_proj = nn.Linear(in_channel, attn_dim)
         self.tar_proj = nn.Linear(in_channel, attn_dim)
         self.q_proj = nn.Linear(attn_dim, attn_dim)
@@ -160,12 +171,27 @@ class TTCHead(nn.Module):
         k = self.k_proj(pair_tokens)
         v = self.v_proj(pair_tokens)
 
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(max(self.attn_dim, 1))
+        q = self.split_attention_heads(q)
+        k = self.split_attention_heads(k)
+        v = self.split_attention_heads(v)
+
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(max(self.cross_attention_head_dim, 1))
         attn_logits = attn_logits * self.attn_logit_scale.exp().clamp(max=10.0)
         attn = F.softmax(attn_logits, dim=-1)
         context = torch.matmul(attn, v)
+        context = self.merge_attention_heads(context)
         scale_states = self.context_norm(scale_queries + self.out_proj(context))
         return self.pred_head(scale_states).squeeze(-1)
+
+    def split_attention_heads(self, x):
+        batch, tokens, channels = x.shape
+        x = x.view(batch, tokens, self.cross_attention_heads, self.cross_attention_head_dim)
+        return x.transpose(1, 2)
+
+    def merge_attention_heads(self, x):
+        batch, heads, tokens, channels = x.shape
+        x = x.transpose(1, 2).contiguous()
+        return x.view(batch, tokens, heads * channels)
 
     def grid_position_tokens(self, output_size, device, dtype):
         coords = torch.linspace(-1.0, 1.0, output_size, device=device, dtype=dtype)

@@ -22,7 +22,7 @@ class Exp(BaseExp):
     def __init__(self):
         super().__init__()
         self.archi_name = 'TTCBase'
-        self.head_type = 'distribution'
+        self.head_type = 'scale_regression'
         # ---------------- model config ---------------- #
         # random seed
         self.seed = 0
@@ -80,6 +80,8 @@ class Exp(BaseExp):
         self.cross_attention_grid_size = 32
         self.cross_attention_position_sigma = 0.35
         self.cross_attention_heads = 4
+        # "ref_to_target" uses ref tokens as Q and target tokens as K/V; "scale_query" keeps the previous scale-query head.
+        self.cross_attention_mode = "ref_to_target"
         # 0 means use the backbone channel count; set 64/128 to increase head capacity.
         self.cross_attention_dim = 0
 
@@ -221,7 +223,8 @@ class Exp(BaseExp):
                        cross_attention_grid_size=self.cross_attention_grid_size,
                        cross_attention_position_sigma=self.cross_attention_position_sigma,
                        cross_attention_dim=(self.cross_attention_dim if self.cross_attention_dim > 0 else None),
-                       cross_attention_heads=self.cross_attention_heads)
+                       cross_attention_heads=self.cross_attention_heads,
+                       cross_attention_mode=self.cross_attention_mode)
 
         def init_model(M):
             for m in M.modules():

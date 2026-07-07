@@ -31,6 +31,7 @@ class TTCHead(nn.Module):
             cross_attention_position_sigma = 0.35,
             cross_attention_dim = None,
             cross_attention_heads = 4,
+            cross_attention_mode = "ref_to_target",
             **kwargs
     ):
         super().__init__()
@@ -61,6 +62,9 @@ class TTCHead(nn.Module):
         self.use_cross_attention = use_cross_attention
         self.cross_attention_grid_size = cross_attention_grid_size
         self.cross_attention_position_sigma = cross_attention_position_sigma
+        self.cross_attention_mode = str(cross_attention_mode).lower()
+        if self.cross_attention_mode not in ("ref_to_target", "scale_query"):
+            raise ValueError("cross_attention_mode must be 'ref_to_target' or 'scale_query'.")
         self.ce_loss = nn.CrossEntropyLoss()
         self.register_buffer(
             "_default_scale_list",
@@ -108,6 +112,12 @@ class TTCHead(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(attn_dim, 1),
         )
+        self.scale_regression_head = nn.Sequential(
+            nn.LayerNorm(attn_dim * 6),
+            nn.Linear(attn_dim * 6, attn_dim * 2),
+            nn.SiLU(inplace=True),
+            nn.Linear(attn_dim * 2, 1),
+        )
         self.attn_logit_scale = nn.Parameter(torch.zeros(1))
 
     def forward(self, xin, tar_boxes,ref_boxes,ttc_imu =None,**kwargs):
@@ -122,6 +132,18 @@ class TTCHead(nn.Module):
         C,H,W = xin.shape[-3:]
         S = self.scale_number
         scale_list = self.get_scale_list(S)
+        if self.cross_attention_mode == "ref_to_target" or self.head_type == "scale_regression":
+            pred_scales = self.ref_target_cross_attention_predict(xin, tar_boxes, ref_boxes, H, W)
+            if self.training:
+                if 'dictAnnos' in kwargs:
+                    frame_gap = kwargs['dictAnnos']['frame_gap']
+                else:
+                    frame_gap = self.sequence_len - 1
+                gt_scales = self.prepare_targets(ttc_imu, frame_gap, pred_scales)
+                gt_scales = gt_scales.clamp(self.min_scale, self.max_scale)
+                return F.l1_loss(pred_scales, gt_scales, reduction="mean")
+            return pred_scales.unsqueeze(-1), scale_list, pred_scales
+
         predictions = self.cross_attention_predict(xin, tar_boxes, ref_boxes, scale_list, H, W)
         if self.training:
             if self.head_type == "distribution":
@@ -144,6 +166,51 @@ class TTCHead(nn.Module):
         if self.head_type == "distribution":
             return F.softmax(predictions, dim=-1), scale_list, None
         return predictions.sigmoid(), scale_list, None
+
+    def ref_target_cross_attention_predict(self, xin, tar_boxes, ref_boxes, H, W):
+        attn_grid = max(1, min(int(self.cross_attention_grid_size), self.grid_size))
+        context_scale = max(float(self.max_scale), 1.0)
+        if self.shift:
+            context_scale *= (self.grid_size + self.shift_kernel_size - 1) / self.grid_size
+
+        ref_maps = xin[::2, ]
+        tar_maps = xin[1::2, ]
+        ref_tokens = self.sample_box_tokens(ref_maps, ref_boxes, attn_grid, H, W, context_scale)
+        tar_tokens = self.sample_box_tokens(tar_maps, tar_boxes, attn_grid, H, W, 1.0)
+
+        position_embed = self.position_proj(
+            self.grid_position_tokens(attn_grid, xin.device, xin.dtype)
+        )
+        ref_tokens = self.ref_proj(ref_tokens) + self.token_type_embed.weight[0].view(1, 1, -1) + position_embed
+        tar_tokens = self.tar_proj(tar_tokens) + self.token_type_embed.weight[1].view(1, 1, -1) + position_embed
+        pair_geometry = self.box_pair_geometry(ref_boxes, tar_boxes, H, W).type_as(xin)
+        geometry_embed = self.geometry_proj(pair_geometry)
+        ref_tokens = self.token_norm(ref_tokens + geometry_embed.unsqueeze(1))
+        tar_tokens = self.token_norm(tar_tokens + geometry_embed.unsqueeze(1))
+
+        q = self.q_proj(self.query_norm(ref_tokens))
+        k = self.k_proj(tar_tokens)
+        v = self.v_proj(tar_tokens)
+
+        q = self.split_attention_heads(q)
+        k = self.split_attention_heads(k)
+        v = self.split_attention_heads(v)
+
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(max(self.cross_attention_head_dim, 1))
+        attn_logits = attn_logits * self.attn_logit_scale.exp().clamp(max=10.0)
+        attn = F.softmax(attn_logits, dim=-1)
+        context = torch.matmul(attn, v)
+        context = self.merge_attention_heads(context)
+        match_tokens = self.context_norm(ref_tokens + self.out_proj(context))
+
+        match_mean = match_tokens.mean(dim=1)
+        match_max = match_tokens.max(dim=1).values
+        ref_mean = ref_tokens.mean(dim=1)
+        tar_mean = tar_tokens.mean(dim=1)
+        delta_mean = (match_tokens - ref_tokens).abs().mean(dim=1)
+        pair_feature = torch.cat([match_mean, match_max, ref_mean, tar_mean, delta_mean, geometry_embed], dim=-1)
+        raw_scale = self.scale_regression_head(pair_feature).squeeze(-1)
+        return torch.sigmoid(raw_scale) * (self.max_scale - self.min_scale) + self.min_scale
 
     def cross_attention_predict(self, xin, tar_boxes, ref_boxes, scale_list, H, W):
         attn_grid = max(1, min(int(self.cross_attention_grid_size), self.grid_size))

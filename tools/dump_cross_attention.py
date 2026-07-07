@@ -39,10 +39,8 @@ def make_parser():
     return parser
 
 
-@torch.no_grad()
-def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
-    C, H, W = xin.shape[-3:]
-    scale_list = head.get_scale_list(head.scale_number).to(device=xin.device, dtype=xin.dtype)
+def _common_tokens(head, xin, tar_boxes, ref_boxes):
+    _, H, W = xin.shape[-3:]
     attn_grid = max(1, min(int(head.cross_attention_grid_size), head.grid_size))
     context_scale = max(float(head.max_scale), 1.0)
     if head.shift:
@@ -60,9 +58,64 @@ def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
     tar_tokens = head.tar_proj(tar_tokens) + head.token_type_embed.weight[1].view(1, 1, -1) + position_embed
     pair_geometry = head.box_pair_geometry(ref_boxes, tar_boxes, H, W).type_as(xin)
     geometry_embed = head.geometry_proj(pair_geometry)
+    return ref_tokens, tar_tokens, pair_geometry, geometry_embed, attn_grid
+
+
+@torch.no_grad()
+def ref_to_target_debug(head, xin, tar_boxes, ref_boxes):
+    ref_tokens, tar_tokens, pair_geometry, geometry_embed, attn_grid = _common_tokens(
+        head, xin, tar_boxes, ref_boxes
+    )
+    ref_tokens = head.token_norm(ref_tokens + geometry_embed.unsqueeze(1))
+    tar_tokens = head.token_norm(tar_tokens + geometry_embed.unsqueeze(1))
+
+    q = head.q_proj(head.query_norm(ref_tokens))
+    k = head.k_proj(tar_tokens)
+    v = head.v_proj(tar_tokens)
+
+    q = head.split_attention_heads(q)
+    k = head.split_attention_heads(k)
+    v = head.split_attention_heads(v)
+
+    attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(max(head.cross_attention_head_dim, 1))
+    attn_logits = attn_logits * head.attn_logit_scale.exp().clamp(max=10.0)
+    attn_heads = F.softmax(attn_logits, dim=-1)
+    context = torch.matmul(attn_heads, v)
+    context = head.merge_attention_heads(context)
+    match_tokens = head.context_norm(ref_tokens + head.out_proj(context))
+
+    match_mean = match_tokens.mean(dim=1)
+    match_max = match_tokens.max(dim=1).values
+    ref_mean = ref_tokens.mean(dim=1)
+    tar_mean = tar_tokens.mean(dim=1)
+    delta_mean = (match_tokens - ref_tokens).abs().mean(dim=1)
+    pair_feature = torch.cat([match_mean, match_max, ref_mean, tar_mean, delta_mean, geometry_embed], dim=-1)
+    raw_scale = head.scale_regression_head(pair_feature).squeeze(-1)
+    pred_scale = torch.sigmoid(raw_scale) * (head.max_scale - head.min_scale) + head.min_scale
+    attn = attn_heads.mean(dim=1)
+    attn_entropy = -(attn * (attn + 1e-12).log()).sum(dim=-1).mean(dim=-1)
+    return {
+        "mode": "ref_to_target",
+        "pred_scale": pred_scale,
+        "raw_scale": raw_scale,
+        "attn": attn,
+        "attn_heads": attn_heads,
+        "attn_entropy": attn_entropy,
+        "attn_grid": attn_grid,
+        "pair_geometry": pair_geometry,
+        "scale_list": head.get_scale_list(head.scale_number).to(device=xin.device, dtype=xin.dtype),
+    }
+
+
+@torch.no_grad()
+def scale_query_debug(head, xin, tar_boxes, ref_boxes):
+    ref_tokens, tar_tokens, pair_geometry, geometry_embed, attn_grid = _common_tokens(
+        head, xin, tar_boxes, ref_boxes
+    )
     pair_tokens = torch.cat([ref_tokens, tar_tokens], dim=1)
     pair_tokens = head.token_norm(pair_tokens + geometry_embed.unsqueeze(1))
 
+    scale_list = head.get_scale_list(head.scale_number).to(device=xin.device, dtype=xin.dtype)
     scale_queries = head.build_scale_queries(scale_list, geometry_embed)
     q = head.q_proj(head.query_norm(scale_queries))
     k = head.k_proj(pair_tokens)
@@ -82,22 +135,31 @@ def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
 
     token_count = attn_grid * attn_grid
     attn = attn_heads.mean(dim=1)
-    ref_attn = attn[..., :token_count]
-    tar_attn = attn[..., token_count:]
+    prob = F.softmax(logits, dim=-1)
+    pred_scale = torch.sum(prob * scale_list.view(1, -1), dim=-1)
     return {
+        "mode": "scale_query",
         "logits": logits,
-        "prob": F.softmax(logits, dim=-1),
+        "prob": prob,
+        "pred_scale": pred_scale,
         "scale_list": scale_list,
         "attn": attn,
         "attn_heads": attn_heads,
-        "ref_attn": ref_attn,
-        "tar_attn": tar_attn,
+        "ref_attn": attn[..., :token_count],
+        "tar_attn": attn[..., token_count:],
         "attn_grid": attn_grid,
         "pair_geometry": pair_geometry,
     }
 
 
-def save_heatmap_png(path, matrix, title):
+@torch.no_grad()
+def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
+    if getattr(head, "cross_attention_mode", "scale_query") == "ref_to_target" or head.head_type == "scale_regression":
+        return ref_to_target_debug(head, xin, tar_boxes, ref_boxes)
+    return scale_query_debug(head, xin, tar_boxes, ref_boxes)
+
+
+def save_heatmap_png(path, matrix, title, xlabel="token index", ylabel="query index"):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -108,8 +170,8 @@ def save_heatmap_png(path, matrix, title):
     plt.figure(figsize=(7.5, 4.5), dpi=160)
     plt.imshow(matrix, aspect="auto", cmap="viridis")
     plt.colorbar(fraction=0.03, pad=0.02)
-    plt.xlabel("token index")
-    plt.ylabel("scale bin")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.title(title)
     plt.tight_layout()
     plt.savefig(path)
@@ -165,9 +227,7 @@ def main():
         ref_boxes, tar_boxes = boxes[::2, :], boxes[1::2, :]
         debug = cross_attention_debug(model.head, backbone_outs, tar_boxes, ref_boxes)
 
-        prob = debug["prob"]
-        scale_list = debug["scale_list"]
-        pred_scale = (prob * scale_list.view(1, -1)).sum(dim=-1)
+        pred_scale = debug["pred_scale"]
         frame_gap = dict_annos.get("frame_gap", exp.sequence_len - 1)
         frame_gap = torch.as_tensor(frame_gap, device=device, dtype=pred_scale.dtype)
         fps = 10.0 / frame_gap
@@ -181,63 +241,76 @@ def main():
                 break
             sample_id = "%04d" % saved
             attn = tensor_to_cpu(debug["attn"][i])
-            ref_attn = tensor_to_cpu(debug["ref_attn"][i])
-            tar_attn = tensor_to_cpu(debug["tar_attn"][i])
-            logits = tensor_to_cpu(debug["logits"][i])
-            prob_i = tensor_to_cpu(prob[i])
-            scale_np = tensor_to_cpu(scale_list)
             geom = tensor_to_cpu(debug["pair_geometry"][i])
+            scale_np = tensor_to_cpu(debug["scale_list"])
 
             npz_path = os.path.join(args.out_dir, sample_id + ".npz")
-            np.savez_compressed(
-                npz_path,
-                attn=attn,
-                attn_heads=tensor_to_cpu(debug["attn_heads"][i]),
-                ref_attn=ref_attn,
-                tar_attn=tar_attn,
-                logits=logits,
-                prob=prob_i,
-                scale_list=scale_np,
-                pair_geometry=geom,
-                pred_scale=float(pred_scale[i].detach().cpu()),
-                gt_scale=float(gt_scale[i].detach().cpu()),
-                pred_ttc=float(pred_ttc[i].detach().cpu()),
-                gt_ttc=float(ttc[i].detach().cpu()),
-                rte=float(rte[i].detach().cpu()),
-                attn_grid=int(debug["attn_grid"]),
-            )
+            save_payload = {
+                "mode": debug["mode"],
+                "attn": attn,
+                "attn_heads": tensor_to_cpu(debug["attn_heads"][i]),
+                "scale_list": scale_np,
+                "pair_geometry": geom,
+                "pred_scale": float(pred_scale[i].detach().cpu()),
+                "gt_scale": float(gt_scale[i].detach().cpu()),
+                "pred_ttc": float(pred_ttc[i].detach().cpu()),
+                "gt_ttc": float(ttc[i].detach().cpu()),
+                "rte": float(rte[i].detach().cpu()),
+                "attn_grid": int(debug["attn_grid"]),
+            }
+            if debug["mode"] == "scale_query":
+                save_payload.update({
+                    "logits": tensor_to_cpu(debug["logits"][i]),
+                    "prob": tensor_to_cpu(debug["prob"][i]),
+                    "ref_attn": tensor_to_cpu(debug["ref_attn"][i]),
+                    "tar_attn": tensor_to_cpu(debug["tar_attn"][i]),
+                })
+            else:
+                save_payload.update({
+                    "raw_scale": float(debug["raw_scale"][i].detach().cpu()),
+                    "attn_entropy": float(debug["attn_entropy"][i].detach().cpu()),
+                })
+            np.savez_compressed(npz_path, **save_payload)
 
             meta = {
                 "sample": sample_id,
+                "mode": debug["mode"],
                 "npz": npz_path,
                 "pred_scale": float(pred_scale[i].detach().cpu()),
                 "gt_scale": float(gt_scale[i].detach().cpu()),
                 "pred_ttc": float(pred_ttc[i].detach().cpu()),
                 "gt_ttc": float(ttc[i].detach().cpu()),
                 "rte": float(rte[i].detach().cpu()),
-                "peak_scale": float(scale_list[prob[i].argmax()].detach().cpu()),
-                "peak_prob": float(prob[i].max().detach().cpu()),
-                "entropy": float((-(prob[i] * (prob[i] + 1e-12).log()).sum()).detach().cpu()),
-                "ref_mass_mean": float(debug["ref_attn"][i].sum(dim=-1).mean().detach().cpu()),
-                "tar_mass_mean": float(debug["tar_attn"][i].sum(dim=-1).mean().detach().cpu()),
             }
+            if debug["mode"] == "scale_query":
+                prob = debug["prob"]
+                scale_list = debug["scale_list"]
+                meta.update({
+                    "peak_scale": float(scale_list[prob[i].argmax()].detach().cpu()),
+                    "peak_prob": float(prob[i].max().detach().cpu()),
+                    "entropy": float((-(prob[i] * (prob[i] + 1e-12).log()).sum()).detach().cpu()),
+                    "ref_mass_mean": float(debug["ref_attn"][i].sum(dim=-1).mean().detach().cpu()),
+                    "tar_mass_mean": float(debug["tar_attn"][i].sum(dim=-1).mean().detach().cpu()),
+                })
+                save_heatmap_png(
+                    os.path.join(args.out_dir, sample_id + "_all_attn.png"),
+                    attn,
+                    "scale query attention, sample " + sample_id,
+                    xlabel="ref+target token index",
+                    ylabel="scale bin",
+                )
+            else:
+                meta.update({
+                    "attn_entropy": float(debug["attn_entropy"][i].detach().cpu()),
+                })
+                save_heatmap_png(
+                    os.path.join(args.out_dir, sample_id + "_ref_to_target_attn.png"),
+                    attn,
+                    "ref-to-target attention, sample " + sample_id,
+                    xlabel="target token index",
+                    ylabel="ref token index",
+                )
             summaries.append(meta)
-
-            save_heatmap_png(
-                os.path.join(args.out_dir, sample_id + "_all_attn.png"),
-                attn,
-                "scale query attention, sample " + sample_id,
-            )
-            save_heatmap_png(
-                os.path.join(args.out_dir, sample_id + "_ref_attn.png"),
-                ref_attn,
-                "ref-token attention, sample " + sample_id,
-            )
-            save_heatmap_png(
-                os.path.join(args.out_dir, sample_id + "_tar_attn.png"),
-                tar_attn,
-                "target-token attention, sample " + sample_id,
-            )
             saved += 1
 
         if saved >= args.num_samples:

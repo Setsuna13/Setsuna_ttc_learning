@@ -85,6 +85,12 @@ class Exp(BaseExp):
         self.cross_attention_window_size = 3
         self.cross_attention_dilations = (1, 3, 6)
         self.cross_attention_dropout = 0.0
+        # FP-TTC-inspired sparse sampling mode. These options are inactive for
+        # dense_qkv and can be selected with cross_attention_mode fp_sparse_qkv.
+        self.sparse_attention_levels = 2
+        self.sparse_attention_points = 4
+        self.sparse_attention_max_offset = 6.0
+        self.sparse_attention_offset_scale = 2.0
         self.dense_attention_context_scale = 1.0
         self.dense_attention_align_centers = True
         self.cross_attention_residual_init = 0.0
@@ -258,6 +264,10 @@ class Exp(BaseExp):
                        cross_attention_window_size=self.cross_attention_window_size,
                        cross_attention_dilations=self.cross_attention_dilations,
                        cross_attention_dropout=self.cross_attention_dropout,
+                       sparse_attention_levels=self.sparse_attention_levels,
+                       sparse_attention_points=self.sparse_attention_points,
+                       sparse_attention_max_offset=self.sparse_attention_max_offset,
+                       sparse_attention_offset_scale=self.sparse_attention_offset_scale,
                        dense_attention_context_scale=self.dense_attention_context_scale,
                        dense_attention_align_centers=self.dense_attention_align_centers,
                        cross_attention_residual_init=self.cross_attention_residual_init,
@@ -442,7 +452,9 @@ class Exp(BaseExp):
     def get_box_downsample_thresh(self):
         if (
                 self.preserve_dense_crop_resolution
-                and str(self.cross_attention_mode).lower() == "dense_qkv"
+                and str(self.cross_attention_mode).lower() in (
+                    "dense_qkv", "fp_sparse_qkv"
+                )
         ):
             return 0
         return self.box_downsample_thresh

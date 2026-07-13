@@ -182,6 +182,35 @@ def dense_qkv_debug(head, xin, tar_boxes, ref_boxes):
 
 
 @torch.no_grad()
+def fp_sparse_qkv_debug(head, xin, tar_boxes, ref_boxes):
+    _, H, W = xin.shape[-3:]
+    scale_list = head.get_scale_list(head.scale_number).to(
+        device=xin.device, dtype=xin.dtype
+    )
+    logits, local = head.fp_sparse_cross_attention_predict(
+        xin, tar_boxes, ref_boxes, H, W, return_debug=True
+    )
+    if head.head_type == "distribution":
+        prob = F.softmax(logits, dim=-1)
+        pred_scale = torch.sum(prob * scale_list.view(1, -1), dim=-1)
+    else:
+        confidence = logits.sigmoid()
+        topk = min(4, confidence.shape[-1])
+        pred_conf, pred_bin = confidence.topk(topk, dim=-1)
+        pred_conf = pred_conf / pred_conf.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        pred_scale = torch.sum(scale_list[pred_bin] * pred_conf, dim=-1)
+        prob = confidence / confidence.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return {
+        "mode": "fp_sparse_qkv",
+        "logits": logits,
+        "prob": prob,
+        "pred_scale": pred_scale,
+        "scale_list": scale_list,
+        **local,
+    }
+
+
+@torch.no_grad()
 def scale_match_debug(head, xin, tar_boxes, ref_boxes):
     _, H, W = xin.shape[-3:]
     scale_list = head.get_scale_list(head.scale_number).to(device=xin.device, dtype=xin.dtype)
@@ -213,6 +242,8 @@ def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
     mode = getattr(head, "cross_attention_mode", "scale_query")
     if mode == "dense_qkv":
         return dense_qkv_debug(head, xin, tar_boxes, ref_boxes)
+    if mode == "fp_sparse_qkv":
+        return fp_sparse_qkv_debug(head, xin, tar_boxes, ref_boxes)
     if mode == "scale_match":
         return scale_match_debug(head, xin, tar_boxes, ref_boxes)
     if mode == "ref_to_target":
@@ -321,7 +352,9 @@ def main():
                 "rte": float(rte[i].detach().cpu()),
                 "attn_grid": int(debug.get("attn_grid", 0)),
             }
-            if debug["mode"] in ("dense_qkv", "scale_query", "scale_match"):
+            if debug["mode"] in (
+                    "dense_qkv", "fp_sparse_qkv", "scale_query", "scale_match"
+            ):
                 save_payload.update({
                     "logits": tensor_to_cpu(debug["logits"][i]),
                     "prob": tensor_to_cpu(debug["prob"][i]),
@@ -339,7 +372,7 @@ def main():
                         "geometry_prior": tensor_to_cpu(debug["geometry_prior"][i]),
                         "attention_window": int(debug["attention_window"]),
                     })
-                else:
+                elif debug["mode"] == "dense_qkv":
                     save_payload.update({
                         "attention_window": int(debug["attention_window"]),
                         "native_hw": np.asarray(debug["native_hw"]),
@@ -355,6 +388,28 @@ def main():
                             debug["attention_dilations"]
                         ),
                         "attention_direction": debug["attention_direction"],
+                    })
+                else:
+                    save_payload.update({
+                        "native_hw": np.asarray(debug["native_hw"]),
+                        "query_mask": tensor_to_cpu(debug["query_mask"][i]),
+                        "reference_mask": tensor_to_cpu(debug["reference_mask"][i]),
+                        "target_mask": tensor_to_cpu(debug["target_mask"][i]),
+                        "expected_offset": tensor_to_cpu(debug["expected_offset"][i]),
+                        "radial_displacement": tensor_to_cpu(
+                            debug["radial_displacement"][i]
+                        ),
+                        "reliability_gate": tensor_to_cpu(
+                            debug["reliability_gate"][i]
+                        ),
+                        "level_mass": tensor_to_cpu(debug["level_mass"][i]),
+                        "sampling_offsets": tensor_to_cpu(
+                            debug["sampling_offsets"][i]
+                        ),
+                        "attention_levels": int(debug["attention_levels"]),
+                        "attention_points": int(debug["attention_points"]),
+                        "attention_direction": debug["attention_direction"],
+                        "attention_method": debug["attention_method"],
                     })
             else:
                 save_payload.update({
@@ -373,7 +428,9 @@ def main():
                 "gt_ttc": float(ttc[i].detach().cpu()),
                 "rte": float(rte[i].detach().cpu()),
             }
-            if debug["mode"] in ("dense_qkv", "scale_query", "scale_match"):
+            if debug["mode"] in (
+                    "dense_qkv", "fp_sparse_qkv", "scale_query", "scale_match"
+            ):
                 prob = debug["prob"]
                 scale_list = debug["scale_list"]
                 meta.update({
@@ -395,7 +452,7 @@ def main():
                     })
                     title = "local scale-match attention, sample " + sample_id
                     xlabel = "local offset index"
-                else:
+                elif debug["mode"] == "dense_qkv":
                     meta.update({
                         "attn_entropy": float(debug["attn_entropy"][i].detach().cpu()),
                         "attention_window": int(debug["attention_window"]),
@@ -408,12 +465,32 @@ def main():
                     })
                     title = "native target-Q/reference-KV attention, sample " + sample_id
                     xlabel = "local offset index"
+                else:
+                    meta.update({
+                        "attn_entropy": float(debug["attn_entropy"][i].detach().cpu()),
+                        "attention_levels": int(debug["attention_levels"]),
+                        "attention_points": int(debug["attention_points"]),
+                        "level_mass": tensor_to_cpu(
+                            debug["level_mass"][i]
+                        ).tolist(),
+                        "reliability_mean": float(
+                            debug["reliability_gate"][i].mean().detach().cpu()
+                        ),
+                        "native_hw": list(debug["native_hw"]),
+                        "attention_direction": debug["attention_direction"],
+                    })
+                    title = "FP-sparse target-Q/reference-KV attention, sample " + sample_id
+                    xlabel = "sparse sample index"
                 save_heatmap_png(
                     os.path.join(args.out_dir, sample_id + "_all_attn.png"),
                     attn,
                     title,
                     xlabel=xlabel,
-                    ylabel=("scale bin" if debug["mode"] != "dense_qkv" else "aggregate"),
+                    ylabel=(
+                        "aggregate"
+                        if debug["mode"] in ("dense_qkv", "fp_sparse_qkv")
+                        else "scale bin"
+                    ),
                 )
             else:
                 meta.update({

@@ -37,6 +37,10 @@ class TTCHead(nn.Module):
             cross_attention_window_size = 3,
             cross_attention_dilations = (1, 3, 6),
             cross_attention_dropout = 0.0,
+            sparse_attention_levels = 2,
+            sparse_attention_points = 4,
+            sparse_attention_max_offset = 6.0,
+            sparse_attention_offset_scale = 2.0,
             dense_attention_context_scale = 1.0,
             dense_attention_align_centers = True,
             cross_attention_residual_init = 0.0,
@@ -86,11 +90,12 @@ class TTCHead(nn.Module):
         self.cross_attention_position_sigma = cross_attention_position_sigma
         self.cross_attention_mode = str(cross_attention_mode).lower()
         if self.cross_attention_mode not in (
-                "dense_qkv", "scale_match", "ref_to_target", "scale_query", "dot_product"
+                "dense_qkv", "fp_sparse_qkv", "scale_match", "ref_to_target",
+                "scale_query", "dot_product"
         ):
             raise ValueError(
-                "cross_attention_mode must be 'dense_qkv', 'scale_match', "
-                "'ref_to_target', 'scale_query', or 'dot_product'."
+                "cross_attention_mode must be 'dense_qkv', 'fp_sparse_qkv', "
+                "'scale_match', 'ref_to_target', 'scale_query', or 'dot_product'."
             )
         cross_attention_window_size = int(cross_attention_window_size)
         if cross_attention_window_size < 1 or cross_attention_window_size % 2 == 0:
@@ -108,6 +113,18 @@ class TTCHead(nn.Module):
                 value < 1 for value in self.cross_attention_dilations
         ):
             raise ValueError("cross_attention_dilations must contain positive integers.")
+        self.sparse_attention_levels = int(sparse_attention_levels)
+        self.sparse_attention_points = int(sparse_attention_points)
+        self.sparse_attention_max_offset = float(sparse_attention_max_offset)
+        self.sparse_attention_offset_scale = float(sparse_attention_offset_scale)
+        if self.sparse_attention_levels < 1:
+            raise ValueError("sparse_attention_levels must be >= 1.")
+        if self.sparse_attention_points < 1:
+            raise ValueError("sparse_attention_points must be >= 1.")
+        if self.sparse_attention_max_offset < 0.0:
+            raise ValueError("sparse_attention_max_offset must be >= 0.")
+        if self.sparse_attention_offset_scale < 0.0:
+            raise ValueError("sparse_attention_offset_scale must be >= 0.")
         self.dense_attention_context_scale = max(float(dense_attention_context_scale), 1.0)
         self.dense_attention_align_centers = bool(dense_attention_align_centers)
         self.cross_attention_geometry_sigma = max(float(cross_attention_geometry_sigma), 1e-3)
@@ -187,6 +204,41 @@ class TTCHead(nn.Module):
         self.dilation_bias = nn.Parameter(
             torch.linspace(0.0, -0.2, len(self.cross_attention_dilations))
         )
+        if self.cross_attention_mode == "fp_sparse_qkv":
+            sparse_hidden = max(attn_dim, 32)
+            self.sparse_query_fusion = nn.Sequential(
+                nn.LayerNorm(attn_dim * 2),
+                nn.Linear(attn_dim * 2, sparse_hidden),
+                nn.SiLU(inplace=True),
+            )
+            self.sparse_offset_proj = nn.Linear(
+                sparse_hidden,
+                cross_attention_heads
+                * self.sparse_attention_levels
+                * self.sparse_attention_points
+                * 2,
+            )
+            self.sparse_attention_bias_proj = nn.Linear(
+                sparse_hidden,
+                cross_attention_heads
+                * self.sparse_attention_levels
+                * self.sparse_attention_points,
+            )
+            self.sparse_level_bias = nn.Parameter(
+                torch.linspace(0.0, -0.1, self.sparse_attention_levels)
+            )
+            self.sparse_reliability_gate = nn.Sequential(
+                nn.LayerNorm(4),
+                nn.Linear(4, 16),
+                nn.SiLU(inplace=True),
+                nn.Linear(16, 1),
+            )
+            nn.init.zeros_(self.sparse_offset_proj.weight)
+            nn.init.zeros_(self.sparse_offset_proj.bias)
+            nn.init.zeros_(self.sparse_attention_bias_proj.weight)
+            nn.init.zeros_(self.sparse_attention_bias_proj.bias)
+            nn.init.zeros_(self.sparse_reliability_gate[-1].weight)
+            nn.init.constant_(self.sparse_reliability_gate[-1].bias, 2.0)
         self.match_feature_norm = nn.LayerNorm(8)
         match_hidden = max(attn_dim, 16)
         self.match_scale_mixer = nn.Sequential(
@@ -207,9 +259,15 @@ class TTCHead(nn.Module):
         # Five confidence statistics, six explicit displacement statistics, and
         # one attention-mass statistic per dilation preserve the scale-motion
         # signal that would otherwise disappear during global aggregation.
-        dense_feature_dim = (
-            attn_dim * 6 + 11 + len(self.cross_attention_dilations)
+        attention_group_count = (
+            self.sparse_attention_levels
+            if self.cross_attention_mode == "fp_sparse_qkv"
+            else len(self.cross_attention_dilations)
         )
+        scalar_motion_dim = (
+            12 if self.cross_attention_mode == "fp_sparse_qkv" else 11
+        )
+        dense_feature_dim = attn_dim * 6 + scalar_motion_dim + attention_group_count
         self.dense_scale_head = nn.Sequential(
             nn.LayerNorm(dense_feature_dim),
             nn.Linear(dense_feature_dim, attn_dim * 2),
@@ -227,8 +285,8 @@ class TTCHead(nn.Module):
             parameter.requires_grad_(trainable)
 
     def freeze_inactive_dense_branches(self):
-        """Avoid DDP reduction failures from legacy branches unused by dense_qkv."""
-        if self.cross_attention_mode != "dense_qkv":
+        """Avoid DDP reduction failures from legacy branches unused by native QKV."""
+        if self.cross_attention_mode not in ("dense_qkv", "fp_sparse_qkv"):
             return
         for module in (
                 self.scale_preds,
@@ -246,6 +304,8 @@ class TTCHead(nn.Module):
                 self.geometry_prior_weight,
         ):
             parameter.requires_grad_(False)
+        if self.cross_attention_mode == "fp_sparse_qkv":
+            self.dilation_bias.requires_grad_(False)
 
     def forward(self, xin, tar_boxes,ref_boxes,ttc_imu =None,**kwargs):
         '''
@@ -262,8 +322,9 @@ class TTCHead(nn.Module):
         if self.cross_attention_mode == "ref_to_target":
             pred_scales = self.ref_target_cross_attention_predict(xin, tar_boxes, ref_boxes, H, W)
             if self.training:
-                if 'dictAnnos' in kwargs:
-                    frame_gap = kwargs['dictAnnos']['frame_gap']
+                dict_annos = kwargs.get('dictAnnos')
+                if dict_annos is not None and 'frame_gap' in dict_annos:
+                    frame_gap = dict_annos['frame_gap']
                 else:
                     frame_gap = self.sequence_len - 1
                 gt_scales = self.prepare_targets(ttc_imu, frame_gap, pred_scales)
@@ -273,6 +334,10 @@ class TTCHead(nn.Module):
 
         if self.cross_attention_mode == "dense_qkv":
             predictions = self.dense_native_cross_attention_predict(
+                xin, tar_boxes, ref_boxes, H, W
+            )
+        elif self.cross_attention_mode == "fp_sparse_qkv":
+            predictions = self.fp_sparse_cross_attention_predict(
                 xin, tar_boxes, ref_boxes, H, W
             )
         elif self.cross_attention_mode == "scale_match":
@@ -288,21 +353,24 @@ class TTCHead(nn.Module):
             predictions = self.cross_attention_predict(xin, tar_boxes, ref_boxes, scale_list, H, W)
         if self.training:
             if self.head_type == "distribution":
-                if 'dictAnnos' in kwargs:
-                    frame_gap = kwargs['dictAnnos']['frame_gap']
+                dict_annos = kwargs.get('dictAnnos')
+                if dict_annos is not None and 'frame_gap' in dict_annos:
+                    frame_gap = dict_annos['frame_gap']
                 else:
                     frame_gap = self.sequence_len - 1
                 gt_scales = self.prepare_targets(ttc_imu, frame_gap, predictions)
-                if self.cross_attention_mode in ("dense_qkv", "scale_match"):
+                if self.cross_attention_mode in (
+                        "dense_qkv", "fp_sparse_qkv", "scale_match"
+                ):
                     return self.get_scale_match_loss(
                         predictions, gt_scales, scale_list, ttc_imu, frame_gap
                     )
                 return self.get_distribution_loss(predictions, gt_scales, scale_list)
 
             predictions = predictions.view(-1,1)
-            if 'dictAnnos' in kwargs:
-                dictAnnos = kwargs['dictAnnos']
-                frame_gap = dictAnnos['frame_gap']
+            dict_annos = kwargs.get('dictAnnos')
+            if dict_annos is not None and 'frame_gap' in dict_annos:
+                frame_gap = dict_annos['frame_gap']
             else:
                 frame_gap = self.sequence_len-1
             gt_one_hot = self.gt_to_one_hot(ttc_imu, gap=frame_gap,scale_list=scale_list, ref_tensor=predictions)
@@ -587,6 +655,499 @@ class TTCHead(nn.Module):
             "attention_direction": "target_q_reference_kv",
         }
         return predictions, debug
+
+    def fp_sparse_cross_attention_predict(
+            self, xin, tar_boxes, ref_boxes, H, W, return_debug=False
+    ):
+        """FP-TTC-inspired sparse target-Q/reference-KV cross-attention.
+
+        Unlike the dense path, this method does not unfold a fixed neighborhood.
+        Each target token predicts a small set of offsets, samples reference K/V
+        from a native-resolution feature pyramid, and retains content-based QK
+        matching over those samples.  ROI Align and crop downsampling are never
+        used.
+        """
+        if xin.ndim != 4 or xin.shape[0] % 2 != 0:
+            raise ValueError(
+                "fp_sparse_qkv expects an even NCHW tensor of interleaved frame pairs."
+            )
+        if tar_boxes.ndim != 2 or ref_boxes.ndim != 2:
+            raise ValueError("tar_boxes and ref_boxes must be rank-2 tensors.")
+        if tar_boxes.shape != ref_boxes.shape or tar_boxes.shape[-1] != 5:
+            raise ValueError(
+                "tar_boxes and ref_boxes must have the same [objects, 5] shape."
+            )
+        if tar_boxes.shape[0] == 0:
+            raise ValueError(
+                "fp_sparse_qkv requires at least one reference/target box pair."
+            )
+
+        ref_maps_all = xin[::2]
+        tar_maps_all = xin[1::2]
+        ref_indices = ref_boxes[:, 0].long()
+        tar_indices = tar_boxes[:, 0].long()
+        if (
+                (ref_indices < 0).any()
+                or (ref_indices >= ref_maps_all.shape[0]).any()
+                or (tar_indices < 0).any()
+                or (tar_indices >= tar_maps_all.shape[0]).any()
+        ):
+            raise IndexError(
+                "An fp_sparse_qkv box batch index is outside the available frame pairs."
+            )
+
+        ref_maps = ref_maps_all.index_select(0, ref_indices)
+        tar_maps = tar_maps_all.index_select(0, tar_indices)
+        batch = tar_maps.shape[0]
+        tokens = H * W
+        levels = self.sparse_attention_levels
+        points = self.sparse_attention_points
+
+        pair_geometry = self.box_pair_geometry(ref_boxes, tar_boxes, H, W).type_as(xin)
+        geometry_embed = self.geometry_proj(pair_geometry)
+        ref_position = self.box_relative_position_tokens(
+            ref_boxes, H, W, xin.dtype, xin.device
+        )
+        tar_position = self.box_relative_position_tokens(
+            tar_boxes, H, W, xin.dtype, xin.device
+        )
+
+        ref_raw = ref_maps.permute(0, 2, 3, 1).reshape(
+            batch, tokens, self.in_channel
+        )
+        tar_raw = tar_maps.permute(0, 2, 3, 1).reshape(
+            batch, tokens, self.in_channel
+        )
+        ref_tokens = self.token_norm(
+            self.ref_proj(ref_raw)
+            + self.token_type_embed.weight[0].view(1, 1, -1)
+            + self.position_proj(ref_position)
+        )
+        tar_tokens = self.token_norm(
+            self.tar_proj(tar_raw)
+            + self.token_type_embed.weight[1].view(1, 1, -1)
+            + self.position_proj(tar_position)
+        )
+
+        ref_state_map = ref_tokens.transpose(1, 2).reshape(
+            batch, self.attn_dim, H, W
+        )
+        ref_mask = self.native_box_mask(
+            ref_boxes,
+            H,
+            W,
+            self.dense_attention_context_scale,
+            xin.dtype,
+            xin.device,
+        )
+        tar_mask = self.native_box_mask(
+            tar_boxes,
+            H,
+            W,
+            self.dense_attention_context_scale,
+            xin.dtype,
+            xin.device,
+        )
+        if self.dense_attention_align_centers:
+            ref_state_map = self.translate_reference_to_target(
+                ref_state_map, ref_boxes, tar_boxes, H, W
+            )
+            ref_mask = self.translate_reference_to_target(
+                ref_mask, ref_boxes, tar_boxes, H, W
+            )
+        aligned_ref_tokens = ref_state_map.flatten(start_dim=-2).transpose(1, 2)
+
+        q = self.split_attention_heads(
+            self.q_proj(self.query_norm(tar_tokens))
+        )
+        q = F.normalize(q, p=2, dim=-1, eps=1e-6)
+        k_map = self.k_proj(aligned_ref_tokens).transpose(1, 2).reshape(
+            batch, self.attn_dim, H, W
+        )
+        v_map = self.v_proj(aligned_ref_tokens).transpose(1, 2).reshape(
+            batch, self.attn_dim, H, W
+        )
+
+        # Reference content participates in offset prediction, while Q itself
+        # remains a pure current-frame projection for directionally correct QKV.
+        offset_state = self.sparse_query_fusion(
+            torch.cat([tar_tokens, aligned_ref_tokens], dim=-1)
+        )
+        offset_residual = self.sparse_offset_proj(offset_state).view(
+            batch,
+            tokens,
+            self.cross_attention_heads,
+            levels,
+            points,
+            2,
+        ).permute(0, 2, 1, 3, 4, 5).contiguous()
+        learned_bias = self.sparse_attention_bias_proj(offset_state).view(
+            batch,
+            tokens,
+            self.cross_attention_heads,
+            levels,
+            points,
+        ).permute(0, 2, 1, 3, 4).contiguous()
+        base_offsets = self.sparse_anchor_offsets(
+            xin.device, xin.dtype
+        ).view(1, self.cross_attention_heads, 1, levels, points, 2)
+        sampling_offsets = base_offsets + self.sparse_attention_offset_scale * (
+            offset_residual.tanh()
+        )
+        learned_bias = learned_bias + self.sparse_level_bias.to(
+            dtype=xin.dtype
+        ).view(1, 1, 1, levels, 1)
+
+        attention_args = (
+            q,
+            k_map,
+            v_map,
+            ref_mask,
+            tar_mask.flatten(start_dim=1),
+            sampling_offsets,
+            learned_bias,
+            self.local_attn_logit_scale,
+        )
+        if self.training and torch.is_grad_enabled():
+            attention_weights, context, query_mask, valid_fraction = checkpoint(
+                self.sparse_multi_scale_attention,
+                *attention_args,
+                use_reentrant=False,
+            )
+        else:
+            attention_weights, context, query_mask, valid_fraction = (
+                self.sparse_multi_scale_attention(*attention_args)
+            )
+        raw_context = self.out_proj(self.merge_attention_heads(context))
+
+        attention_confidence_map = attention_weights.max(dim=-1).values.mean(dim=1)
+        attention_entropy = -(
+            attention_weights * (attention_weights + 1e-12).log()
+        ).sum(dim=-1).mean(dim=1)
+        total_keys = levels * points
+        attention_focus_map = 1.0 - attention_entropy / math.log(max(total_keys, 2))
+        aligned_similarity = F.cosine_similarity(
+            tar_tokens, raw_context, dim=-1, eps=1e-6
+        )
+        reliability_features = torch.stack([
+            aligned_similarity,
+            attention_confidence_map,
+            attention_focus_map,
+            valid_fraction,
+        ], dim=-1)
+        reliability_gate = self.sparse_reliability_gate(
+            reliability_features
+        ).squeeze(-1).sigmoid()
+        reliability_gate = reliability_gate * query_mask
+        gated_context = raw_context * reliability_gate.unsqueeze(-1)
+        match_tokens = self.context_norm(tar_tokens + gated_context)
+
+        tar_mean = self.masked_token_mean(tar_tokens, query_mask)
+        ref_mean = self.masked_token_mean(
+            aligned_ref_tokens, ref_mask.flatten(start_dim=1)
+        )
+        context_mean = self.masked_token_mean(gated_context, query_mask)
+        delta_mean = self.masked_token_mean(
+            (match_tokens - tar_tokens).abs(), query_mask
+        )
+        product_mean = self.masked_token_mean(
+            tar_tokens * gated_context, query_mask
+        )
+
+        similarity_mean = self.masked_scalar_mean(
+            aligned_similarity, query_mask
+        )
+        similarity_std = self.masked_scalar_std(
+            aligned_similarity, query_mask, similarity_mean
+        )
+        similarity_max = self.masked_scalar_max(
+            aligned_similarity, query_mask
+        )
+        attention_confidence = self.masked_scalar_mean(
+            attention_confidence_map, query_mask
+        )
+        attention_focus = self.masked_scalar_mean(
+            attention_focus_map, query_mask
+        )
+        reliability_mean = self.masked_scalar_mean(
+            reliability_gate, query_mask
+        )
+        scalar_features = torch.stack([
+            similarity_mean,
+            similarity_max,
+            similarity_std,
+            attention_confidence,
+            attention_focus,
+            reliability_mean,
+        ], dim=-1)
+
+        flat_offsets = sampling_offsets.reshape(
+            batch,
+            self.cross_attention_heads,
+            tokens,
+            total_keys,
+            2,
+        )
+        expected_offsets_per_head = (
+            attention_weights.unsqueeze(-1) * flat_offsets
+        ).sum(dim=-2)
+        expected_offsets = expected_offsets_per_head.mean(dim=1)
+        tar_xyxy = self.boxes_to_feature_xyxy(tar_boxes, H, W).type_as(xin)
+        tar_half_size = torch.stack([
+            (tar_xyxy[:, 2] - tar_xyxy[:, 0]).clamp_min(1.0) * 0.5,
+            (tar_xyxy[:, 3] - tar_xyxy[:, 1]).clamp_min(1.0) * 0.5,
+        ], dim=-1)
+        normalized_offsets = expected_offsets / tar_half_size[:, None, :]
+        radial_unit = tar_position / tar_position.norm(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+        tangential_unit = torch.stack([
+            -radial_unit[..., 1], radial_unit[..., 0]
+        ], dim=-1)
+        radial_displacement = (normalized_offsets * radial_unit).sum(dim=-1)
+        tangential_displacement = (
+            normalized_offsets * tangential_unit
+        ).sum(dim=-1)
+        offset_magnitude = normalized_offsets.norm(dim=-1)
+        radial_mean = self.masked_scalar_mean(radial_displacement, query_mask)
+        magnitude_mean = self.masked_scalar_mean(offset_magnitude, query_mask)
+        motion_features = torch.stack([
+            radial_mean,
+            self.masked_scalar_std(
+                radial_displacement, query_mask, radial_mean
+            ),
+            self.masked_scalar_mean(
+                radial_displacement.abs(), query_mask
+            ),
+            magnitude_mean,
+            self.masked_scalar_std(
+                offset_magnitude, query_mask, magnitude_mean
+            ),
+            self.masked_scalar_mean(
+                tangential_displacement.abs(), query_mask
+            ),
+        ], dim=-1)
+        level_mass = torch.stack([
+            self.masked_scalar_mean(
+                attention_weights[
+                    ..., level * points:(level + 1) * points
+                ].sum(dim=-1).mean(dim=1),
+                query_mask,
+            )
+            for level in range(levels)
+        ], dim=-1)
+
+        pair_feature = torch.cat([
+            tar_mean,
+            ref_mean,
+            context_mean,
+            delta_mean,
+            product_mean,
+            geometry_embed,
+            scalar_features,
+            motion_features,
+            level_mass,
+        ], dim=-1)
+        predictions = self.dense_scale_head(pair_feature)
+        if not return_debug:
+            return predictions
+
+        weighted_attn = attention_weights * query_mask[:, None, :, None]
+        attn_summary = weighted_attn.sum(dim=(1, 2)) / (
+            query_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            * self.cross_attention_heads
+        )
+        debug = {
+            "attn": attn_summary.unsqueeze(1),
+            "attn_heads": attention_weights,
+            "attn_entropy": self.masked_scalar_mean(
+                attention_entropy, query_mask
+            ),
+            "pair_geometry": pair_geometry,
+            "query_mask": query_mask.view(batch, 1, H, W),
+            "reference_mask": ref_mask,
+            "target_mask": tar_mask,
+            "expected_offset": expected_offsets.transpose(1, 2).reshape(
+                batch, 2, H, W
+            ),
+            "radial_displacement": radial_displacement.view(
+                batch, 1, H, W
+            ),
+            "reliability_gate": reliability_gate.view(batch, 1, H, W),
+            "level_mass": level_mass,
+            "sampling_offsets": sampling_offsets,
+            "native_hw": (H, W),
+            "attention_levels": levels,
+            "attention_points": points,
+            "attention_direction": "target_q_reference_kv",
+            "attention_method": "fp_sparse_qkv",
+        }
+        return predictions, debug
+
+    def sparse_multi_scale_attention(
+            self,
+            q,
+            k_map,
+            v_map,
+            ref_mask,
+            target_query_mask,
+            sampling_offsets,
+            attention_bias,
+            logit_scale,
+    ):
+        """Sample sparse reference K/V without materialising local patches."""
+        batch, heads, tokens, levels, points, _ = sampling_offsets.shape
+        _, _, H, W = k_map.shape
+        if tokens != H * W:
+            raise ValueError("Sparse attention token count does not match H*W.")
+
+        y = (torch.arange(H, device=q.device, dtype=q.dtype) + 0.5) * 2.0 / H - 1.0
+        x = (torch.arange(W, device=q.device, dtype=q.dtype) + 0.5) * 2.0 / W - 1.0
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        base_grid = torch.stack([xx, yy], dim=-1).reshape(
+            1, 1, tokens, 1, 2
+        )
+        offset_normalizer = q.new_tensor([2.0 / W, 2.0 / H]).view(
+            1, 1, 1, 1, 2
+        )
+
+        logits = []
+        valid_masks = []
+        sample_grids = []
+        for level in range(levels):
+            scale = 2 ** level
+            if scale == 1:
+                k_level = k_map
+                mask_level = ref_mask
+            else:
+                k_level = F.avg_pool2d(
+                    k_map, kernel_size=scale, stride=scale, ceil_mode=True
+                )
+                mask_level = F.avg_pool2d(
+                    ref_mask, kernel_size=scale, stride=scale, ceil_mode=True
+                )
+            grid = base_grid + sampling_offsets[..., level, :, :] * offset_normalizer
+            sample_grids.append(grid)
+            sampled_k = self.sample_sparse_head_map(k_level, grid)
+            sampled_k = F.normalize(sampled_k, p=2, dim=-1, eps=1e-6)
+            level_logits = torch.matmul(
+                q.unsqueeze(-2), sampled_k.transpose(-1, -2)
+            ).squeeze(-2)
+            logits.append(level_logits)
+            valid_masks.append(
+                self.sample_sparse_mask(mask_level, grid) > 1e-4
+            )
+
+        attention_logits = torch.cat(logits, dim=-1)
+        attention_logits = (
+            attention_logits * logit_scale.exp().clamp(1.0, 20.0)
+            + attention_bias.reshape(batch, heads, tokens, levels * points)
+        )
+        valid_keys = torch.cat(valid_masks, dim=-1)
+        attention_logits = attention_logits.masked_fill(~valid_keys, -1e4)
+        attention_weights = F.softmax(
+            attention_logits.float(), dim=-1
+        ).to(attention_logits.dtype)
+        attention_weights = attention_weights * valid_keys.to(
+            attention_weights.dtype
+        )
+        attention_weights = attention_weights / attention_weights.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-12)
+        has_valid_key = valid_keys.any(dim=-1).any(dim=1)
+        query_mask = target_query_mask * has_valid_key.to(target_query_mask.dtype)
+        attention_weights = attention_weights * (
+            query_mask[:, None, :, None] > 1e-4
+        ).to(attention_weights.dtype)
+        dropped_attention = F.dropout(
+            attention_weights,
+            p=self.cross_attention_dropout,
+            training=self.training,
+        )
+
+        context = torch.zeros_like(q)
+        for level in range(levels):
+            scale = 2 ** level
+            if scale == 1:
+                v_level = v_map
+            else:
+                v_level = F.avg_pool2d(
+                    v_map, kernel_size=scale, stride=scale, ceil_mode=True
+                )
+            sampled_v = self.sample_sparse_head_map(
+                v_level, sample_grids[level]
+            )
+            level_attention = dropped_attention[
+                ..., level * points:(level + 1) * points
+            ]
+            context = context + torch.matmul(
+                level_attention.unsqueeze(-2), sampled_v
+            ).squeeze(-2)
+
+        valid_fraction = valid_keys.to(q.dtype).mean(dim=(1, 3))
+        return attention_weights, context, query_mask, valid_fraction
+
+    def sample_sparse_head_map(self, feature_map, grid):
+        batch, _, height, width = feature_map.shape
+        heads = self.cross_attention_heads
+        head_dim = self.cross_attention_head_dim
+        tokens, points = grid.shape[-3:-1]
+        feature_heads = feature_map.reshape(
+            batch, heads, head_dim, height, width
+        ).reshape(batch * heads, head_dim, height, width)
+        sampled = F.grid_sample(
+            feature_heads,
+            grid.reshape(batch * heads, tokens, points, 2),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        return sampled.reshape(
+            batch, heads, head_dim, tokens, points
+        ).permute(0, 1, 3, 4, 2).contiguous()
+
+    def sample_sparse_mask(self, mask, grid):
+        batch, _, height, width = mask.shape
+        heads = self.cross_attention_heads
+        tokens, points = grid.shape[-3:-1]
+        mask_heads = mask[:, None].expand(
+            batch, heads, 1, height, width
+        ).reshape(batch * heads, 1, height, width)
+        sampled = F.grid_sample(
+            mask_heads,
+            grid.reshape(batch * heads, tokens, points, 2),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        return sampled.reshape(batch, heads, tokens, points)
+
+    def sparse_anchor_offsets(self, device, dtype):
+        """Deterministic centre-plus-ring initialization in feature pixels."""
+        heads = self.cross_attention_heads
+        levels = self.sparse_attention_levels
+        points = self.sparse_attention_points
+        anchors = torch.zeros(
+            heads, levels, points, 2, device=device, dtype=dtype
+        )
+        if points == 1 or self.sparse_attention_max_offset == 0.0:
+            return anchors
+        radii = torch.linspace(
+            min(1.0, self.sparse_attention_max_offset),
+            self.sparse_attention_max_offset,
+            levels,
+            device=device,
+            dtype=dtype,
+        )
+        ring_points = points - 1
+        for head in range(heads):
+            phase = (head / float(max(heads, 1))) * (2.0 * math.pi / ring_points)
+            angles = torch.arange(
+                ring_points, device=device, dtype=dtype
+            ) * (2.0 * math.pi / ring_points) + phase
+            directions = torch.stack([angles.cos(), angles.sin()], dim=-1)
+            anchors[head, :, 1:, :] = radii[:, None, None] * directions[None]
+        return anchors
 
     def native_box_mask(self, boxes, H, W, context_scale, dtype, device):
         box_xyxy = self.boxes_to_feature_xyxy(

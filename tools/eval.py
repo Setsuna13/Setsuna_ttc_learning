@@ -153,7 +153,7 @@ def main(exp, args, num_gpu):
         if str(exp.cross_attention_mode).lower() != "dot_product":
             raise ValueError(
                 "--allow-partial-load is restricted to dot_product baseline evaluation. "
-                "A dense_qkv checkpoint must be loaded strictly so random attention "
+                "A native QKV checkpoint must be loaded strictly so random attention "
                 "parameters cannot be evaluated by mistake."
             )
         model = load_ckpt(model, ckpt["model"])

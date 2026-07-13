@@ -153,9 +153,72 @@ def scale_query_debug(head, xin, tar_boxes, ref_boxes):
 
 
 @torch.no_grad()
+def dense_qkv_debug(head, xin, tar_boxes, ref_boxes):
+    _, H, W = xin.shape[-3:]
+    scale_list = head.get_scale_list(head.scale_number).to(
+        device=xin.device, dtype=xin.dtype
+    )
+    logits, local = head.dense_native_cross_attention_predict(
+        xin, tar_boxes, ref_boxes, H, W, return_debug=True
+    )
+    if head.head_type == "distribution":
+        prob = F.softmax(logits, dim=-1)
+        pred_scale = torch.sum(prob * scale_list.view(1, -1), dim=-1)
+    else:
+        confidence = logits.sigmoid()
+        topk = min(4, confidence.shape[-1])
+        pred_conf, pred_bin = confidence.topk(topk, dim=-1)
+        pred_conf = pred_conf / pred_conf.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        pred_scale = torch.sum(scale_list[pred_bin] * pred_conf, dim=-1)
+        prob = confidence / confidence.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return {
+        "mode": "dense_qkv",
+        "logits": logits,
+        "prob": prob,
+        "pred_scale": pred_scale,
+        "scale_list": scale_list,
+        **local,
+    }
+
+
+@torch.no_grad()
+def scale_match_debug(head, xin, tar_boxes, ref_boxes):
+    _, H, W = xin.shape[-3:]
+    scale_list = head.get_scale_list(head.scale_number).to(device=xin.device, dtype=xin.dtype)
+    logits, local = head.scale_match_cross_attention_predict(
+        xin, tar_boxes, ref_boxes, scale_list, H, W, return_debug=True
+    )
+    if head.head_type == "distribution":
+        prob = F.softmax(logits, dim=-1)
+        pred_scale = torch.sum(prob * scale_list.view(1, -1), dim=-1)
+    else:
+        confidence = logits.sigmoid()
+        topk = min(4, confidence.shape[-1])
+        pred_conf, pred_bin = confidence.topk(topk, dim=-1)
+        pred_conf = pred_conf / pred_conf.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        pred_scale = torch.sum(scale_list[pred_bin] * pred_conf, dim=-1)
+        prob = confidence / confidence.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return {
+        "mode": "scale_match",
+        "logits": logits,
+        "prob": prob,
+        "pred_scale": pred_scale,
+        "scale_list": scale_list,
+        **local,
+    }
+
+
+@torch.no_grad()
 def cross_attention_debug(head, xin, tar_boxes, ref_boxes):
-    if getattr(head, "cross_attention_mode", "scale_query") == "ref_to_target" or head.head_type == "scale_regression":
+    mode = getattr(head, "cross_attention_mode", "scale_query")
+    if mode == "dense_qkv":
+        return dense_qkv_debug(head, xin, tar_boxes, ref_boxes)
+    if mode == "scale_match":
+        return scale_match_debug(head, xin, tar_boxes, ref_boxes)
+    if mode == "ref_to_target":
         return ref_to_target_debug(head, xin, tar_boxes, ref_boxes)
+    if mode == "dot_product":
+        raise ValueError("dot_product mode has no cross-attention matrix to dump")
     return scale_query_debug(head, xin, tar_boxes, ref_boxes)
 
 
@@ -256,15 +319,43 @@ def main():
                 "pred_ttc": float(pred_ttc[i].detach().cpu()),
                 "gt_ttc": float(ttc[i].detach().cpu()),
                 "rte": float(rte[i].detach().cpu()),
-                "attn_grid": int(debug["attn_grid"]),
+                "attn_grid": int(debug.get("attn_grid", 0)),
             }
-            if debug["mode"] == "scale_query":
+            if debug["mode"] in ("dense_qkv", "scale_query", "scale_match"):
                 save_payload.update({
                     "logits": tensor_to_cpu(debug["logits"][i]),
                     "prob": tensor_to_cpu(debug["prob"][i]),
-                    "ref_attn": tensor_to_cpu(debug["ref_attn"][i]),
-                    "tar_attn": tensor_to_cpu(debug["tar_attn"][i]),
                 })
+                if debug["mode"] == "scale_query":
+                    save_payload.update({
+                        "ref_attn": tensor_to_cpu(debug["ref_attn"][i]),
+                        "tar_attn": tensor_to_cpu(debug["tar_attn"][i]),
+                    })
+                elif debug["mode"] == "scale_match":
+                    save_payload.update({
+                        "baseline_scores": tensor_to_cpu(debug["baseline_scores"][i]),
+                        "baseline_logits": tensor_to_cpu(debug["baseline_logits"][i]),
+                        "attention_residual": tensor_to_cpu(debug["attention_residual"][i]),
+                        "geometry_prior": tensor_to_cpu(debug["geometry_prior"][i]),
+                        "attention_window": int(debug["attention_window"]),
+                    })
+                else:
+                    save_payload.update({
+                        "attention_window": int(debug["attention_window"]),
+                        "native_hw": np.asarray(debug["native_hw"]),
+                        "query_mask": tensor_to_cpu(debug["query_mask"][i]),
+                        "reference_mask": tensor_to_cpu(debug["reference_mask"][i]),
+                        "target_mask": tensor_to_cpu(debug["target_mask"][i]),
+                        "expected_offset": tensor_to_cpu(debug["expected_offset"][i]),
+                        "radial_displacement": tensor_to_cpu(
+                            debug["radial_displacement"][i]
+                        ),
+                        "dilation_mass": tensor_to_cpu(debug["dilation_mass"][i]),
+                        "attention_dilations": np.asarray(
+                            debug["attention_dilations"]
+                        ),
+                        "attention_direction": debug["attention_direction"],
+                    })
             else:
                 save_payload.update({
                     "raw_scale": float(debug["raw_scale"][i].detach().cpu()),
@@ -282,22 +373,47 @@ def main():
                 "gt_ttc": float(ttc[i].detach().cpu()),
                 "rte": float(rte[i].detach().cpu()),
             }
-            if debug["mode"] == "scale_query":
+            if debug["mode"] in ("dense_qkv", "scale_query", "scale_match"):
                 prob = debug["prob"]
                 scale_list = debug["scale_list"]
                 meta.update({
                     "peak_scale": float(scale_list[prob[i].argmax()].detach().cpu()),
                     "peak_prob": float(prob[i].max().detach().cpu()),
                     "entropy": float((-(prob[i] * (prob[i] + 1e-12).log()).sum()).detach().cpu()),
-                    "ref_mass_mean": float(debug["ref_attn"][i].sum(dim=-1).mean().detach().cpu()),
-                    "tar_mass_mean": float(debug["tar_attn"][i].sum(dim=-1).mean().detach().cpu()),
                 })
+                if debug["mode"] == "scale_query":
+                    meta.update({
+                        "ref_mass_mean": float(debug["ref_attn"][i].sum(dim=-1).mean().detach().cpu()),
+                        "tar_mass_mean": float(debug["tar_attn"][i].sum(dim=-1).mean().detach().cpu()),
+                    })
+                    title = "scale query attention, sample " + sample_id
+                    xlabel = "ref+target token index"
+                elif debug["mode"] == "scale_match":
+                    meta.update({
+                        "attn_entropy": float(debug["attn_entropy"][i].detach().cpu()),
+                        "attention_window": int(debug["attention_window"]),
+                    })
+                    title = "local scale-match attention, sample " + sample_id
+                    xlabel = "local offset index"
+                else:
+                    meta.update({
+                        "attn_entropy": float(debug["attn_entropy"][i].detach().cpu()),
+                        "attention_window": int(debug["attention_window"]),
+                        "attention_dilations": list(debug["attention_dilations"]),
+                        "dilation_mass": tensor_to_cpu(
+                            debug["dilation_mass"][i]
+                        ).tolist(),
+                        "native_hw": list(debug["native_hw"]),
+                        "attention_direction": debug["attention_direction"],
+                    })
+                    title = "native target-Q/reference-KV attention, sample " + sample_id
+                    xlabel = "local offset index"
                 save_heatmap_png(
                     os.path.join(args.out_dir, sample_id + "_all_attn.png"),
                     attn,
-                    "scale query attention, sample " + sample_id,
-                    xlabel="ref+target token index",
-                    ylabel="scale bin",
+                    title,
+                    xlabel=xlabel,
+                    ylabel=("scale bin" if debug["mode"] != "dense_qkv" else "aggregate"),
                 )
             else:
                 meta.update({

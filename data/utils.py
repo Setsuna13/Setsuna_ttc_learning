@@ -109,7 +109,11 @@ def get_cropped_imgs(ref_img, tar_img, ref_box, tar_box, receptive_filed=32, max
 
     ref, tar = crop_bbox_img(ref_img, _ref_box), crop_bbox_img(tar_img, _tar_box)
 
-    if max(ref.shape) > max_unit_size:
+    if (
+            max_unit_size is not None
+            and max_unit_size > 0
+            and max(ref.shape) > max_unit_size
+    ):
         ref = downsample_img(ref, )
         tar = downsample_img(tar, )
         ref_padding = [int(ele / 2) for ele in ref_padding]
@@ -200,4 +204,3 @@ def load_json(name):
 def save_json(filename, data):
     with open(filename, 'w') as f:
         json.dump(data, f)
-

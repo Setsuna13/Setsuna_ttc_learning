@@ -1,7 +1,9 @@
 from torch import nn
 from .network_blocks import FocalLoss
+from torchvision.ops import roi_align
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import math
 from data.ttc_dataset import ttc_to_scale_ratio, scale_ratio_to_ttc
 
@@ -31,7 +33,27 @@ class TTCHead(nn.Module):
             cross_attention_position_sigma = 0.35,
             cross_attention_dim = None,
             cross_attention_heads = 4,
-            cross_attention_mode = "ref_to_target",
+            cross_attention_mode = "dense_qkv",
+            cross_attention_window_size = 3,
+            cross_attention_dilations = (1, 3, 6),
+            cross_attention_dropout = 0.0,
+            dense_attention_context_scale = 1.0,
+            dense_attention_align_centers = True,
+            cross_attention_residual_init = 0.0,
+            cross_attention_geometry_sigma = 0.08,
+            cross_attention_geometry_weight = 0.0,
+            cross_attention_reg_loss_weight = 0.25,
+            cross_attention_ttc_loss_weight = 1.0,
+            ttc_metric_clip = 20.0,
+            ttc_metric_min_denom = 1.0,
+            ttc_metric_huber_beta = 0.1,
+            ttc_metric_short_loss_weight = 0.1,
+            ttc_metric_mid_ttc_abs_thresh = 3.0,
+            ttc_metric_mid_loss_weight = 0.5,
+            ttc_metric_long_ttc_abs_thresh = 6.0,
+            ttc_metric_long_loss_weight = 0.85,
+            ttc_metric_tail_ttc_abs_thresh = 12.0,
+            ttc_metric_tail_loss_weight = 1.0,
             **kwargs
     ):
         super().__init__()
@@ -57,14 +79,50 @@ class TTCHead(nn.Module):
         self.normalize_similarity = normalize_similarity
         self.similarity_topk_ratio = similarity_topk_ratio
         self.similarity_topk_weight = similarity_topk_weight
-        if not use_cross_attention:
-            raise ValueError("The legacy ROI Align enumeration head has been removed; use_cross_attention must be True.")
-        self.use_cross_attention = use_cross_attention
+        self.use_cross_attention = bool(use_cross_attention)
+        if not self.use_cross_attention:
+            cross_attention_mode = "dot_product"
         self.cross_attention_grid_size = cross_attention_grid_size
         self.cross_attention_position_sigma = cross_attention_position_sigma
         self.cross_attention_mode = str(cross_attention_mode).lower()
-        if self.cross_attention_mode not in ("ref_to_target", "scale_query"):
-            raise ValueError("cross_attention_mode must be 'ref_to_target' or 'scale_query'.")
+        if self.cross_attention_mode not in (
+                "dense_qkv", "scale_match", "ref_to_target", "scale_query", "dot_product"
+        ):
+            raise ValueError(
+                "cross_attention_mode must be 'dense_qkv', 'scale_match', "
+                "'ref_to_target', 'scale_query', or 'dot_product'."
+            )
+        cross_attention_window_size = int(cross_attention_window_size)
+        if cross_attention_window_size < 1 or cross_attention_window_size % 2 == 0:
+            raise ValueError("cross_attention_window_size must be a positive odd number.")
+        self.cross_attention_window_size = cross_attention_window_size
+        self.cross_attention_dropout = float(cross_attention_dropout)
+        if not 0.0 <= self.cross_attention_dropout < 1.0:
+            raise ValueError("cross_attention_dropout must be in [0, 1).")
+        if isinstance(cross_attention_dilations, int):
+            cross_attention_dilations = (cross_attention_dilations,)
+        self.cross_attention_dilations = tuple(
+            dict.fromkeys(int(value) for value in cross_attention_dilations)
+        )
+        if not self.cross_attention_dilations or any(
+                value < 1 for value in self.cross_attention_dilations
+        ):
+            raise ValueError("cross_attention_dilations must contain positive integers.")
+        self.dense_attention_context_scale = max(float(dense_attention_context_scale), 1.0)
+        self.dense_attention_align_centers = bool(dense_attention_align_centers)
+        self.cross_attention_geometry_sigma = max(float(cross_attention_geometry_sigma), 1e-3)
+        self.cross_attention_reg_loss_weight = max(float(cross_attention_reg_loss_weight), 0.0)
+        self.cross_attention_ttc_loss_weight = max(float(cross_attention_ttc_loss_weight), 0.0)
+        self.ttc_metric_clip = float(ttc_metric_clip)
+        self.ttc_metric_min_denom = max(float(ttc_metric_min_denom), 1e-6)
+        self.ttc_metric_huber_beta = max(float(ttc_metric_huber_beta), 1e-6)
+        self.ttc_metric_short_loss_weight = float(ttc_metric_short_loss_weight)
+        self.ttc_metric_mid_ttc_abs_thresh = float(ttc_metric_mid_ttc_abs_thresh)
+        self.ttc_metric_mid_loss_weight = float(ttc_metric_mid_loss_weight)
+        self.ttc_metric_long_ttc_abs_thresh = float(ttc_metric_long_ttc_abs_thresh)
+        self.ttc_metric_long_loss_weight = float(ttc_metric_long_loss_weight)
+        self.ttc_metric_tail_ttc_abs_thresh = float(ttc_metric_tail_ttc_abs_thresh)
+        self.ttc_metric_tail_loss_weight = float(ttc_metric_tail_loss_weight)
         self.ce_loss = nn.CrossEntropyLoss()
         self.register_buffer(
             "_default_scale_list",
@@ -84,6 +142,12 @@ class TTCHead(nn.Module):
         self.attn_dim = attn_dim
         self.cross_attention_heads = cross_attention_heads
         self.cross_attention_head_dim = attn_dim // cross_attention_heads
+        # Keep the official calibration layer name so old dot-product weights can
+        # warm-start the exact fallback branch of the hybrid matcher.
+        self.scale_preds = nn.Linear(scale_number, scale_number)
+        with torch.no_grad():
+            self.scale_preds.weight.copy_(torch.eye(scale_number))
+            self.scale_preds.bias.zero_()
         self.ref_proj = nn.Linear(in_channel, attn_dim)
         self.tar_proj = nn.Linear(in_channel, attn_dim)
         self.q_proj = nn.Linear(attn_dim, attn_dim)
@@ -119,6 +183,69 @@ class TTCHead(nn.Module):
             nn.Linear(attn_dim * 2, 1),
         )
         self.attn_logit_scale = nn.Parameter(torch.zeros(1))
+        self.local_attn_logit_scale = nn.Parameter(torch.tensor(math.log(5.0)))
+        self.dilation_bias = nn.Parameter(
+            torch.linspace(0.0, -0.2, len(self.cross_attention_dilations))
+        )
+        self.match_feature_norm = nn.LayerNorm(8)
+        match_hidden = max(attn_dim, 16)
+        self.match_scale_mixer = nn.Sequential(
+            nn.Conv1d(8, match_hidden, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv1d(match_hidden, match_hidden, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv1d(match_hidden, 1, kernel_size=1),
+        )
+        nn.init.normal_(self.match_scale_mixer[-1].weight, std=2e-2)
+        nn.init.zeros_(self.match_scale_mixer[-1].bias)
+        self.attention_residual_gate = nn.Parameter(torch.tensor(float(cross_attention_residual_init)))
+        # Zero initialization preserves the official dot-product logits at
+        # cold start; data must earn any direct geometry contribution.
+        self.geometry_prior_weight = nn.Parameter(
+            torch.tensor(float(cross_attention_geometry_weight))
+        )
+        # Five confidence statistics, six explicit displacement statistics, and
+        # one attention-mass statistic per dilation preserve the scale-motion
+        # signal that would otherwise disappear during global aggregation.
+        dense_feature_dim = (
+            attn_dim * 6 + 11 + len(self.cross_attention_dilations)
+        )
+        self.dense_scale_head = nn.Sequential(
+            nn.LayerNorm(dense_feature_dim),
+            nn.Linear(dense_feature_dim, attn_dim * 2),
+            nn.SiLU(inplace=True),
+            nn.Dropout(self.cross_attention_dropout),
+            nn.Linear(attn_dim * 2, attn_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(attn_dim, scale_number),
+        )
+        self.freeze_inactive_dense_branches()
+
+    @staticmethod
+    def set_module_trainable(module, trainable):
+        for parameter in module.parameters():
+            parameter.requires_grad_(trainable)
+
+    def freeze_inactive_dense_branches(self):
+        """Avoid DDP reduction failures from legacy branches unused by dense_qkv."""
+        if self.cross_attention_mode != "dense_qkv":
+            return
+        for module in (
+                self.scale_preds,
+                self.scale_index_embed,
+                self.scale_value_proj,
+                self.pred_head,
+                self.scale_regression_head,
+                self.match_feature_norm,
+                self.match_scale_mixer,
+        ):
+            self.set_module_trainable(module, False)
+        for parameter in (
+                self.attn_logit_scale,
+                self.attention_residual_gate,
+                self.geometry_prior_weight,
+        ):
+            parameter.requires_grad_(False)
 
     def forward(self, xin, tar_boxes,ref_boxes,ttc_imu =None,**kwargs):
         '''
@@ -132,7 +259,7 @@ class TTCHead(nn.Module):
         C,H,W = xin.shape[-3:]
         S = self.scale_number
         scale_list = self.get_scale_list(S)
-        if self.cross_attention_mode == "ref_to_target" or self.head_type == "scale_regression":
+        if self.cross_attention_mode == "ref_to_target":
             pred_scales = self.ref_target_cross_attention_predict(xin, tar_boxes, ref_boxes, H, W)
             if self.training:
                 if 'dictAnnos' in kwargs:
@@ -144,7 +271,21 @@ class TTCHead(nn.Module):
                 return F.l1_loss(pred_scales, gt_scales, reduction="mean")
             return pred_scales.unsqueeze(-1), scale_list, pred_scales
 
-        predictions = self.cross_attention_predict(xin, tar_boxes, ref_boxes, scale_list, H, W)
+        if self.cross_attention_mode == "dense_qkv":
+            predictions = self.dense_native_cross_attention_predict(
+                xin, tar_boxes, ref_boxes, H, W
+            )
+        elif self.cross_attention_mode == "scale_match":
+            predictions = self.scale_match_cross_attention_predict(
+                xin, tar_boxes, ref_boxes, scale_list, H, W
+            )
+        elif self.cross_attention_mode == "dot_product":
+            predictions, _, _ = self.legacy_dot_product_scores(
+                xin, tar_boxes, ref_boxes, scale_list, H, W
+            )
+            predictions = self.scale_preds(predictions)
+        else:
+            predictions = self.cross_attention_predict(xin, tar_boxes, ref_boxes, scale_list, H, W)
         if self.training:
             if self.head_type == "distribution":
                 if 'dictAnnos' in kwargs:
@@ -152,6 +293,10 @@ class TTCHead(nn.Module):
                 else:
                     frame_gap = self.sequence_len - 1
                 gt_scales = self.prepare_targets(ttc_imu, frame_gap, predictions)
+                if self.cross_attention_mode in ("dense_qkv", "scale_match"):
+                    return self.get_scale_match_loss(
+                        predictions, gt_scales, scale_list, ttc_imu, frame_gap
+                    )
                 return self.get_distribution_loss(predictions, gt_scales, scale_list)
 
             predictions = predictions.view(-1,1)
@@ -166,6 +311,689 @@ class TTCHead(nn.Module):
         if self.head_type == "distribution":
             return F.softmax(predictions, dim=-1), scale_list, None
         return predictions.sigmoid(), scale_list, None
+
+    def dense_native_cross_attention_predict(
+            self, xin, tar_boxes, ref_boxes, H, W, return_debug=False
+    ):
+        """Native-resolution target-Q/reference-KV sliding cross-attention.
+
+        This path never calls ROI Align and never resizes the target feature
+        map.  Reference features are translated (not scaled) so the two box
+        centres share a coordinate system; the inter-frame object-size change
+        therefore remains visible to the attention head.
+        """
+        if xin.ndim != 4 or xin.shape[0] % 2 != 0:
+            raise ValueError("dense_qkv expects an even NCHW tensor of interleaved frame pairs.")
+        if tar_boxes.ndim != 2 or ref_boxes.ndim != 2:
+            raise ValueError("tar_boxes and ref_boxes must be rank-2 tensors.")
+        if tar_boxes.shape != ref_boxes.shape or tar_boxes.shape[-1] != 5:
+            raise ValueError("tar_boxes and ref_boxes must have the same [objects, 5] shape.")
+        if tar_boxes.shape[0] == 0:
+            raise ValueError("dense_qkv requires at least one reference/target box pair.")
+        ref_maps_all = xin[::2]
+        tar_maps_all = xin[1::2]
+        ref_indices = ref_boxes[:, 0].long()
+        tar_indices = tar_boxes[:, 0].long()
+        if (
+                (ref_indices < 0).any()
+                or (ref_indices >= ref_maps_all.shape[0]).any()
+                or (tar_indices < 0).any()
+                or (tar_indices >= tar_maps_all.shape[0]).any()
+        ):
+            raise IndexError("A dense_qkv box batch index is outside the available frame pairs.")
+        ref_maps = ref_maps_all.index_select(0, ref_indices)
+        tar_maps = tar_maps_all.index_select(0, tar_indices)
+        batch = tar_maps.shape[0]
+        tokens = H * W
+        window = self.cross_attention_window_size
+
+        pair_geometry = self.box_pair_geometry(ref_boxes, tar_boxes, H, W).type_as(xin)
+        geometry_embed = self.geometry_proj(pair_geometry)
+        ref_position = self.box_relative_position_tokens(
+            ref_boxes, H, W, xin.dtype, xin.device
+        )
+        tar_position = self.box_relative_position_tokens(
+            tar_boxes, H, W, xin.dtype, xin.device
+        )
+
+        ref_raw = ref_maps.permute(0, 2, 3, 1).reshape(batch, tokens, self.in_channel)
+        tar_raw = tar_maps.permute(0, 2, 3, 1).reshape(batch, tokens, self.in_channel)
+        ref_tokens = self.ref_proj(ref_raw)
+        ref_tokens = self.token_norm(
+            ref_tokens
+            + self.token_type_embed.weight[0].view(1, 1, -1)
+            + self.position_proj(ref_position)
+        )
+        tar_tokens = self.tar_proj(tar_raw)
+        tar_tokens = self.token_norm(
+            tar_tokens
+            + self.token_type_embed.weight[1].view(1, 1, -1)
+            + self.position_proj(tar_position)
+        )
+
+        ref_state_map = ref_tokens.transpose(1, 2).reshape(
+            batch, self.attn_dim, H, W
+        )
+        ref_mask = self.native_box_mask(
+            ref_boxes, H, W, self.dense_attention_context_scale, xin.dtype, xin.device
+        )
+        tar_mask = self.native_box_mask(
+            tar_boxes, H, W, self.dense_attention_context_scale, xin.dtype, xin.device
+        )
+        if self.dense_attention_align_centers:
+            ref_state_map = self.translate_reference_to_target(
+                ref_state_map, ref_boxes, tar_boxes, H, W
+            )
+            ref_mask = self.translate_reference_to_target(
+                ref_mask, ref_boxes, tar_boxes, H, W
+            )
+        aligned_ref_tokens = ref_state_map.flatten(start_dim=-2).transpose(1, 2)
+
+        # The current/target frame is Q; the centre-aligned reference frame is
+        # K/V. This keeps the output anchored to the frame whose TTC is being
+        # estimated, while retaining the reference object's native scale.
+        q = self.split_attention_heads(
+            self.q_proj(self.query_norm(tar_tokens))
+        )
+        q = F.normalize(q, p=2, dim=-1, eps=1e-6)
+        k_map = self.k_proj(aligned_ref_tokens).transpose(1, 2).reshape(
+            batch, self.attn_dim, H, W
+        )
+        v_map = self.v_proj(aligned_ref_tokens).transpose(1, 2).reshape(
+            batch, self.attn_dim, H, W
+        )
+
+        key_masks = []
+        position_biases = []
+        key_offsets = []
+        dilation_slices = []
+        key_start = 0
+        for dilation_index, dilation in enumerate(self.cross_attention_dilations):
+            mask_patch = F.unfold(
+                ref_mask,
+                kernel_size=window,
+                dilation=dilation,
+                padding=(window // 2) * dilation,
+            ).transpose(1, 2)
+            branch_keys = window * window
+            key_masks.append(mask_patch)
+            position_biases.append(
+                self.local_position_bias(window, xin.device, xin.dtype)
+                + self.dilation_bias[dilation_index].to(dtype=xin.dtype)
+            )
+            key_offsets.append(
+                self.local_key_offsets(window, dilation, xin.device, xin.dtype)
+            )
+            dilation_slices.append(slice(key_start, key_start + branch_keys))
+            key_start += branch_keys
+
+        key_mask = torch.cat(key_masks, dim=-1)
+        valid_keys = key_mask[:, None] > 1e-4
+        has_valid_key = valid_keys.any(dim=-1).squeeze(1)
+        query_mask = tar_mask.flatten(start_dim=1) * has_valid_key.to(xin.dtype)
+        position_bias = torch.cat(position_biases, dim=-1)
+        attention_args = (
+            q,
+            k_map,
+            v_map,
+            valid_keys,
+            query_mask,
+            position_bias,
+            self.local_attn_logit_scale,
+        )
+        if self.training and torch.is_grad_enabled():
+            attention_weights, context = checkpoint(
+                self.native_multi_dilation_attention,
+                *attention_args,
+                use_reentrant=False,
+            )
+        else:
+            attention_weights, context = self.native_multi_dilation_attention(
+                *attention_args
+            )
+        context = self.out_proj(self.merge_attention_heads(context))
+        match_tokens = self.context_norm(tar_tokens + context)
+
+        tar_mean = self.masked_token_mean(
+            tar_tokens, query_mask
+        )
+        ref_mean = self.masked_token_mean(
+            aligned_ref_tokens, ref_mask.flatten(start_dim=1)
+        )
+        context_mean = self.masked_token_mean(context, query_mask)
+        delta_mean = self.masked_token_mean(
+            (match_tokens - tar_tokens).abs(), query_mask
+        )
+        product_mean = self.masked_token_mean(
+            tar_tokens * context, query_mask
+        )
+
+        aligned_similarity = F.cosine_similarity(
+            tar_tokens, context, dim=-1, eps=1e-6
+        )
+        similarity_mean = self.masked_scalar_mean(
+            aligned_similarity, query_mask
+        )
+        similarity_std = self.masked_scalar_std(
+            aligned_similarity, query_mask, similarity_mean
+        )
+        similarity_max = self.masked_scalar_max(
+            aligned_similarity, query_mask
+        )
+        attention_confidence = self.masked_scalar_mean(
+            attention_weights.max(dim=-1).values.mean(dim=1), query_mask
+        )
+        attention_entropy = -(
+            attention_weights * (attention_weights + 1e-12).log()
+        ).sum(dim=-1)
+        attention_entropy = attention_entropy.mean(dim=1)
+        total_keys = attention_weights.shape[-1]
+        attention_focus = 1.0 - self.masked_scalar_mean(
+            attention_entropy, query_mask
+        ) / math.log(max(total_keys, 2))
+        scalar_features = torch.stack([
+            similarity_mean,
+            similarity_max,
+            similarity_std,
+            attention_confidence,
+            attention_focus,
+        ], dim=-1)
+
+        offsets = torch.cat(key_offsets, dim=0)
+        expected_offsets_per_head = (
+            attention_weights.unsqueeze(-1)
+            * offsets.view(1, 1, 1, total_keys, 2)
+        ).sum(dim=-2)
+        expected_offsets = expected_offsets_per_head.mean(dim=1)
+        tar_xyxy = self.boxes_to_feature_xyxy(tar_boxes, H, W).type_as(xin)
+        tar_half_size = torch.stack([
+            (tar_xyxy[:, 2] - tar_xyxy[:, 0]).clamp_min(1.0) * 0.5,
+            (tar_xyxy[:, 3] - tar_xyxy[:, 1]).clamp_min(1.0) * 0.5,
+        ], dim=-1)
+        normalized_offsets = expected_offsets / tar_half_size[:, None, :]
+        radial_unit = tar_position / tar_position.norm(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+        tangential_unit = torch.stack([
+            -radial_unit[..., 1], radial_unit[..., 0]
+        ], dim=-1)
+        radial_displacement = (normalized_offsets * radial_unit).sum(dim=-1)
+        tangential_displacement = (
+            normalized_offsets * tangential_unit
+        ).sum(dim=-1)
+        offset_magnitude = normalized_offsets.norm(dim=-1)
+        radial_mean = self.masked_scalar_mean(radial_displacement, query_mask)
+        motion_features = torch.stack([
+            radial_mean,
+            self.masked_scalar_std(
+                radial_displacement, query_mask, radial_mean
+            ),
+            self.masked_scalar_mean(radial_displacement.abs(), query_mask),
+            self.masked_scalar_mean(offset_magnitude, query_mask),
+            self.masked_scalar_std(
+                offset_magnitude,
+                query_mask,
+                self.masked_scalar_mean(offset_magnitude, query_mask),
+            ),
+            self.masked_scalar_mean(
+                tangential_displacement.abs(), query_mask
+            ),
+        ], dim=-1)
+        dilation_mass = torch.stack([
+            self.masked_scalar_mean(
+                attention_weights[..., dilation_slice].sum(dim=-1).mean(dim=1),
+                query_mask,
+            )
+            for dilation_slice in dilation_slices
+        ], dim=-1)
+        pair_feature = torch.cat([
+            tar_mean,
+            ref_mean,
+            context_mean,
+            delta_mean,
+            product_mean,
+            geometry_embed,
+            scalar_features,
+            motion_features,
+            dilation_mass,
+        ], dim=-1)
+        predictions = self.dense_scale_head(pair_feature)
+        if not return_debug:
+            return predictions
+
+        weighted_attn = attention_weights * query_mask[:, None, :, None]
+        attn_summary = weighted_attn.sum(dim=(1, 2)) / (
+            query_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            * self.cross_attention_heads
+        )
+        debug = {
+            "attn": attn_summary.unsqueeze(1),
+            "attn_heads": attention_weights,
+            "attn_entropy": self.masked_scalar_mean(
+                attention_entropy, query_mask
+            ),
+            "pair_geometry": pair_geometry,
+            "query_mask": query_mask.view(batch, 1, H, W),
+            "reference_mask": ref_mask,
+            "target_mask": tar_mask,
+            "expected_offset": expected_offsets.transpose(1, 2).reshape(
+                batch, 2, H, W
+            ),
+            "radial_displacement": radial_displacement.view(batch, 1, H, W),
+            "dilation_mass": dilation_mass,
+            "native_hw": (H, W),
+            "attention_window": window,
+            "attention_dilations": self.cross_attention_dilations,
+            "attention_direction": "target_q_reference_kv",
+        }
+        return predictions, debug
+
+    def native_box_mask(self, boxes, H, W, context_scale, dtype, device):
+        box_xyxy = self.boxes_to_feature_xyxy(
+            boxes.to(device=device, dtype=dtype), H, W
+        )
+        x1, y1, x2, y2 = box_xyxy.unbind(dim=-1)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        half_w = (x2 - x1).clamp_min(1.0) * context_scale * 0.5
+        half_h = (y2 - y1).clamp_min(1.0) * context_scale * 0.5
+        xx = torch.arange(W, device=device, dtype=dtype).view(1, 1, W) + 0.5
+        yy = torch.arange(H, device=device, dtype=dtype).view(1, H, 1) + 0.5
+        mask_x = (xx >= (cx - half_w)[:, None, None]) & (
+            xx <= (cx + half_w)[:, None, None]
+        )
+        mask_y = (yy >= (cy - half_h)[:, None, None]) & (
+            yy <= (cy + half_h)[:, None, None]
+        )
+        return (mask_x & mask_y).to(dtype=dtype).unsqueeze(1)
+
+    def box_relative_position_tokens(self, boxes, H, W, dtype, device):
+        box_xyxy = self.boxes_to_feature_xyxy(
+            boxes.to(device=device, dtype=dtype), H, W
+        )
+        x1, y1, x2, y2 = box_xyxy.unbind(dim=-1)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        half_w = (x2 - x1).clamp_min(1.0) * 0.5
+        half_h = (y2 - y1).clamp_min(1.0) * 0.5
+        xx = torch.arange(W, device=device, dtype=dtype).view(1, 1, W) + 0.5
+        yy = torch.arange(H, device=device, dtype=dtype).view(1, H, 1) + 0.5
+        rel_x = ((xx - cx[:, None, None]) / half_w[:, None, None]).expand(-1, H, -1)
+        rel_y = ((yy - cy[:, None, None]) / half_h[:, None, None]).expand(-1, -1, W)
+        return torch.stack([rel_x, rel_y], dim=-1).clamp(-4.0, 4.0).reshape(
+            boxes.shape[0], H * W, 2
+        )
+
+    def translate_reference_to_target(
+            self, tensor, ref_boxes, tar_boxes, H, W
+    ):
+        ref = self.boxes_to_feature_xyxy(ref_boxes, H, W).type_as(tensor)
+        tar = self.boxes_to_feature_xyxy(tar_boxes, H, W).type_as(tensor)
+        ref_cx = (ref[:, 0] + ref[:, 2]) * 0.5
+        ref_cy = (ref[:, 1] + ref[:, 3]) * 0.5
+        tar_cx = (tar[:, 0] + tar[:, 2]) * 0.5
+        tar_cy = (tar[:, 1] + tar[:, 3]) * 0.5
+        x = (torch.arange(W, device=tensor.device, dtype=tensor.dtype) + 0.5) * 2.0 / W - 1.0
+        y = (torch.arange(H, device=tensor.device, dtype=tensor.dtype) + 0.5) * 2.0 / H - 1.0
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack([xx, yy], dim=-1).unsqueeze(0).expand(
+            tensor.shape[0], -1, -1, -1
+        ).clone()
+        grid[..., 0] += (2.0 * (ref_cx - tar_cx) / W)[:, None, None]
+        grid[..., 1] += (2.0 * (ref_cy - tar_cy) / H)[:, None, None]
+        return F.grid_sample(
+            tensor,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+
+    def native_multi_dilation_attention(
+            self,
+            q,
+            k_map,
+            v_map,
+            valid_keys,
+            query_mask,
+            position_bias,
+            logit_scale,
+    ):
+        """Compute dilation branches sequentially to cap native-resolution memory."""
+        window = self.cross_attention_window_size
+        logits = []
+        for dilation in self.cross_attention_dilations:
+            key_patch = self.unfold_native_local_heads(
+                k_map, window, dilation=dilation
+            )
+            key_patch = F.normalize(key_patch, p=2, dim=-1, eps=1e-6)
+            logits.append((q.unsqueeze(-2) * key_patch).sum(dim=-1))
+        attention_logits = torch.cat(logits, dim=-1)
+        attention_logits = (
+            attention_logits * logit_scale.exp().clamp(1.0, 20.0)
+            + position_bias
+        )
+        attention_logits = attention_logits.masked_fill(~valid_keys, -1e4)
+        attention_weights = F.softmax(
+            attention_logits.float(), dim=-1
+        ).to(attention_logits.dtype)
+        # Softmax over an entirely masked window is otherwise uniform. Remove
+        # invalid keys explicitly and renormalize only windows containing data.
+        attention_weights = (
+            attention_weights * valid_keys.to(attention_weights.dtype)
+        )
+        attention_weights = attention_weights / attention_weights.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-12)
+        attention_weights = attention_weights * (
+            query_mask[:, None, :, None] > 1e-4
+        ).to(attention_weights.dtype)
+        dropped_attention = F.dropout(
+            attention_weights,
+            p=self.cross_attention_dropout,
+            training=self.training,
+        )
+
+        context = torch.zeros_like(q)
+        branch_keys = window * window
+        for index, dilation in enumerate(self.cross_attention_dilations):
+            value_patch = self.unfold_native_local_heads(
+                v_map, window, dilation=dilation
+            )
+            start = index * branch_keys
+            branch_attention = dropped_attention[
+                ..., start:start + branch_keys
+            ]
+            context = context + (
+                branch_attention.unsqueeze(-1) * value_patch
+            ).sum(dim=-2)
+        return attention_weights, context
+
+    def unfold_native_local_heads(self, feature_map, window, dilation=1):
+        batch, _, _, _ = feature_map.shape
+        patches = F.unfold(
+            feature_map,
+            kernel_size=window,
+            dilation=dilation,
+            padding=(window // 2) * dilation,
+        )
+        tokens = patches.shape[-1]
+        patches = patches.view(
+            batch,
+            self.cross_attention_heads,
+            self.cross_attention_head_dim,
+            window * window,
+            tokens,
+        )
+        return patches.permute(0, 1, 4, 3, 2).contiguous()
+
+    @staticmethod
+    def local_key_offsets(window, dilation, device, dtype):
+        radius = window // 2
+        offsets = torch.arange(
+            -radius, radius + 1, device=device, dtype=dtype
+        ) * dilation
+        yy, xx = torch.meshgrid(offsets, offsets, indexing="ij")
+        return torch.stack([xx, yy], dim=-1).reshape(window * window, 2)
+
+    @staticmethod
+    def masked_token_mean(values, mask):
+        denominator = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return (values * mask.unsqueeze(-1)).sum(dim=1) / denominator
+
+    @staticmethod
+    def masked_scalar_mean(values, mask):
+        denominator = mask.sum(dim=-1).clamp_min(1.0)
+        return (values * mask).sum(dim=-1) / denominator
+
+    @staticmethod
+    def masked_scalar_std(values, mask, mean):
+        denominator = mask.sum(dim=-1).clamp_min(1.0)
+        variance = ((values - mean.unsqueeze(-1)).square() * mask).sum(dim=-1)
+        return (variance / denominator).clamp_min(0.0).sqrt()
+
+    @staticmethod
+    def masked_scalar_max(values, mask):
+        masked = values.masked_fill(mask <= 0.0, -torch.finfo(values.dtype).max)
+        maximum = masked.max(dim=-1).values
+        has_valid_value = mask.sum(dim=-1) > 0.0
+        return torch.where(has_valid_value, maximum, torch.zeros_like(maximum))
+
+    def scale_match_cross_attention_predict(
+            self, xin, tar_boxes, ref_boxes, scale_list, H, W, return_debug=False
+    ):
+        """Ref-to-target local cross-attention residual over the dot-product baseline."""
+        baseline_scores, tar_features, ref_context = self.legacy_dot_product_scores(
+            xin, tar_boxes, ref_boxes, scale_list, H, W
+        )
+        baseline_logits = self.scale_preds(baseline_scores)
+
+        batch = tar_features.shape[0]
+        scales = scale_list.numel()
+        attn_grid = max(1, min(int(self.cross_attention_grid_size), self.grid_size))
+        window = self.cross_attention_window_size
+        radius = window // 2
+
+        tar_small = F.adaptive_avg_pool2d(tar_features, (attn_grid, attn_grid))
+        tar_context = F.pad(
+            tar_small, (radius, radius, radius, radius), mode="replicate"
+        ) if radius > 0 else tar_small
+        ref_context_small = F.adaptive_avg_pool2d(
+            ref_context, (attn_grid + 2 * radius, attn_grid + 2 * radius)
+        )
+        ref_query_map = ref_context_small[
+            :, :, radius:radius + attn_grid, radius:radius + attn_grid
+        ]
+
+        pair_geometry = self.box_pair_geometry(ref_boxes, tar_boxes, H, W).type_as(xin)
+        geometry_embed = self.geometry_proj(pair_geometry)
+        position_embed = self.position_proj(
+            self.grid_position_tokens(attn_grid, xin.device, xin.dtype)
+        )
+        scale_value_embed = self.scale_value_embeddings(scale_list, xin.dtype, xin.device)
+
+        ref_raw_tokens = ref_query_map.flatten(start_dim=-2).transpose(1, 2)
+        ref_tokens = self.ref_proj(ref_raw_tokens).view(
+            batch, scales, attn_grid * attn_grid, self.attn_dim
+        )
+        ref_tokens = ref_tokens + self.token_type_embed.weight[0].view(1, 1, 1, -1)
+        ref_tokens = self.token_norm(
+            ref_tokens
+            + position_embed[:, None]
+            + scale_value_embed.view(1, scales, 1, -1)
+            + geometry_embed[:, None, None, :]
+        )
+        ref_queries = ref_tokens.reshape(
+            batch * scales, attn_grid * attn_grid, self.attn_dim
+        )
+
+        tar_raw_tokens = tar_context.flatten(start_dim=-2).transpose(1, 2)
+        tar_tokens = self.tar_proj(tar_raw_tokens)
+        tar_tokens = tar_tokens + self.token_type_embed.weight[1].view(1, 1, -1)
+        tar_tokens = self.token_norm(tar_tokens + geometry_embed.unsqueeze(1))
+
+        q = self.split_attention_heads(self.q_proj(self.query_norm(ref_queries)))
+        q = F.normalize(q, p=2, dim=-1, eps=1e-6)
+
+        context_grid = attn_grid + 2 * radius
+        k_map = self.k_proj(tar_tokens).transpose(1, 2).reshape(
+            batch, self.attn_dim, context_grid, context_grid
+        )
+        v_map = self.v_proj(tar_tokens).transpose(1, 2).reshape(
+            batch, self.attn_dim, context_grid, context_grid
+        )
+        k = self.unfold_local_heads(k_map, window)
+        v = self.unfold_local_heads(v_map, window)
+        k = k[:, None].expand(-1, scales, -1, -1, -1, -1).reshape(
+            batch * scales,
+            self.cross_attention_heads,
+            attn_grid * attn_grid,
+            window * window,
+            self.cross_attention_head_dim,
+        )
+        v = v[:, None].expand(-1, scales, -1, -1, -1, -1).reshape_as(k)
+        k = F.normalize(k, p=2, dim=-1, eps=1e-6)
+
+        attn_logits = (q.unsqueeze(-2) * k).sum(dim=-1)
+        attn_logits = attn_logits * self.local_attn_logit_scale.exp().clamp(1.0, 20.0)
+        attn_logits = attn_logits + self.local_position_bias(
+            window, xin.device, xin.dtype
+        )
+        attn = F.softmax(attn_logits.float(), dim=-1).to(dtype=attn_logits.dtype)
+        attn = F.dropout(
+            attn, p=self.cross_attention_dropout, training=self.training
+        )
+        context = (attn.unsqueeze(-1) * v).sum(dim=-2)
+        context = self.out_proj(self.merge_attention_heads(context))
+
+        match_tokens = self.context_norm(ref_queries + context)
+        aligned_similarity = F.cosine_similarity(
+            ref_queries, context, dim=-1, eps=1e-6
+        )
+        aligned_mean = aligned_similarity.mean(dim=-1).view(batch, scales)
+        topk_ratio = max(float(self.similarity_topk_ratio), 0.05)
+        topk_count = max(1, int(aligned_similarity.shape[-1] * topk_ratio))
+        topk_count = min(topk_count, aligned_similarity.shape[-1])
+        aligned_topk = aligned_similarity.topk(
+            topk_count, dim=-1
+        ).values.mean(dim=-1).view(batch, scales)
+        match_delta = (match_tokens - ref_queries).abs().mean(
+            dim=(-1, -2)
+        ).view(batch, scales)
+        attention_confidence = attn.max(dim=-1).values.mean(
+            dim=(1, 2)
+        ).view(batch, scales)
+
+        geometry_prior, geometry_offset = self.scale_geometry_prior(
+            scale_list, pair_geometry
+        )
+        scale_norm = self.normalized_scale_values(scale_list).to(
+            dtype=xin.dtype, device=xin.device
+        )
+        scale_norm = scale_norm.view(1, scales).expand(batch, -1)
+        match_features = torch.stack([
+            baseline_scores,
+            aligned_mean,
+            aligned_topk,
+            1.0 - match_delta,
+            attention_confidence,
+            geometry_prior / 10.0,
+            geometry_offset.clamp(-5.0, 5.0) / 5.0,
+            scale_norm,
+        ], dim=-1)
+        match_features = self.match_feature_norm(match_features)
+        attention_residual = self.match_scale_mixer(
+            match_features.transpose(1, 2)
+        ).squeeze(1)
+
+        residual_gate = torch.tanh(self.attention_residual_gate)
+        geometry_weight = 2.0 * torch.tanh(self.geometry_prior_weight)
+        predictions = (
+            baseline_logits
+            + residual_gate * attention_residual
+            + geometry_weight * geometry_prior
+        )
+        if not return_debug:
+            return predictions
+
+        attn_heads = attn.view(
+            batch, scales, self.cross_attention_heads,
+            attn_grid * attn_grid, window * window
+        )
+        attn_summary = attn_heads.mean(dim=(2, 3))
+        attn_entropy = -(attn_heads * (attn_heads + 1e-12).log()).sum(dim=-1)
+        attn_entropy = attn_entropy.mean(dim=(1, 2, 3))
+        debug = {
+            "attn": attn_summary,
+            "attn_heads": attn_heads,
+            "attn_entropy": attn_entropy,
+            "baseline_scores": baseline_scores,
+            "baseline_logits": baseline_logits,
+            "attention_residual": attention_residual,
+            "geometry_prior": geometry_prior,
+            "geometry_offset": geometry_offset,
+            "pair_geometry": pair_geometry,
+            "attn_grid": attn_grid,
+            "attention_window": window,
+            "attention_direction": "ref_to_target",
+        }
+        return predictions, debug
+
+    def legacy_dot_product_scores(self, xin, tar_boxes, ref_boxes, scale_list, H, W):
+        """Return original TSTTC scale scores and reusable ROI features."""
+        grid = self.grid_size
+        scales = scale_list.numel()
+        batch = tar_boxes.shape[0]
+        ref_roi_boxes, tar_roi_boxes = self.boxes_sample(ref_boxes, tar_boxes, scale_list, H, W)
+        ref_roi_boxes = ref_roi_boxes.type_as(xin)
+        tar_roi_boxes = tar_roi_boxes.type_as(xin)
+        ref_maps = xin[::2]
+        tar_maps = xin[1::2]
+        tar_features = roi_align(tar_maps, tar_roi_boxes, (grid, grid))
+        tar_match = tar_features.view(batch, 1, 1, self.in_channel, grid, grid)
+
+        if self.shift:
+            context_grid = grid + self.shift_kernel_size - 1
+            ref_context = roi_align(ref_maps, ref_roi_boxes, (context_grid, context_grid))
+            ref_match = self.shift_split(ref_context).view(
+                batch, scales, self.shift_kernel_size ** 2, self.in_channel, grid, grid
+            )
+        else:
+            ref_context = roi_align(ref_maps, ref_roi_boxes, (grid, grid))
+            ref_match = ref_context.view(batch, scales, 1, self.in_channel, grid, grid)
+
+        if self.normalize_similarity:
+            tar_match = F.normalize(tar_match, p=2, dim=3, eps=1e-6)
+            ref_match = F.normalize(ref_match, p=2, dim=3, eps=1e-6)
+        similarity = (tar_match * ref_match).sum(dim=3).flatten(start_dim=-2)
+        mean_score = similarity.mean(dim=-1)
+        topk_weight = max(0.0, min(1.0, self.similarity_topk_weight))
+        if topk_weight > 0.0:
+            topk_ratio = max(0.0, min(1.0, self.similarity_topk_ratio))
+            topk_count = max(1, int(similarity.shape[-1] * topk_ratio))
+            topk_score = similarity.topk(topk_count, dim=-1).values.mean(dim=-1)
+            scores = (1.0 - topk_weight) * mean_score + topk_weight * topk_score
+        else:
+            scores = mean_score
+        scores = scores.max(dim=2).values
+        return scores, tar_features, ref_context
+
+    def unfold_local_heads(self, feature_map, window):
+        batch_scales, _, height, width = feature_map.shape
+        patches = F.unfold(feature_map, kernel_size=window)
+        tokens = patches.shape[-1]
+        patches = patches.view(
+            batch_scales, self.cross_attention_heads, self.cross_attention_head_dim,
+            window * window, tokens
+        )
+        return patches.permute(0, 1, 4, 3, 2).contiguous()
+
+    def local_position_bias(self, window, device, dtype):
+        radius = window // 2
+        offsets = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(offsets, offsets, indexing="ij")
+        sigma = max(float(window) * self.cross_attention_position_sigma, 0.5)
+        bias = -(xx.square() + yy.square()) / (2.0 * sigma * sigma)
+        return bias.reshape(1, 1, 1, window * window)
+
+    def normalized_scale_values(self, scale_list):
+        denom = max(float(self.max_scale - self.min_scale), 1e-6)
+        return (scale_list - self.min_scale) / denom * 2.0 - 1.0
+
+    def scale_value_embeddings(self, scale_list, dtype, device):
+        values = self.normalized_scale_values(scale_list).to(device=device, dtype=dtype)
+        return self.scale_value_proj(values.view(-1, 1))
+
+    def scale_geometry_prior(self, scale_list, pair_geometry):
+        log_scales = scale_list.to(
+            device=pair_geometry.device, dtype=pair_geometry.dtype
+        ).clamp_min(1e-6).log()
+        # pair_geometry stores log(tar/ref); a candidate scale is ref/tar.
+        observed_log_scale = -0.5 * (pair_geometry[:, 0] + pair_geometry[:, 1])
+        offset = (
+            log_scales.view(1, -1) - observed_log_scale.view(-1, 1)
+        ) / self.cross_attention_geometry_sigma
+        return -0.5 * offset.square().clamp(max=20.0), offset
 
     def ref_target_cross_attention_predict(self, xin, tar_boxes, ref_boxes, H, W):
         attn_grid = max(1, min(int(self.cross_attention_grid_size), self.grid_size))
@@ -406,6 +1234,119 @@ class TTCHead(nn.Module):
         loss_l = F.nll_loss(log_probs, idx_l, reduction="none")
         loss_r = F.nll_loss(log_probs, idx_r, reduction="none")
         return (loss_l * weight_l + loss_r * weight_r).mean()
+
+    def get_scale_match_loss(
+            self, logits, gt_scales, scale_list, gt_ttcs=None, frame_gap=None
+    ):
+        distribution_loss = self.get_distribution_loss(logits, gt_scales, scale_list)
+        probabilities = F.softmax(logits, dim=-1)
+        scale_list = scale_list.to(device=logits.device, dtype=logits.dtype)
+        expected_scale = (probabilities * scale_list.view(1, -1)).sum(dim=-1)
+
+        total_loss = distribution_loss
+        if self.cross_attention_reg_loss_weight > 0.0:
+            step = max(
+                (self.max_scale - self.min_scale) / max(self.scale_number - 1, 1),
+                1e-6,
+            )
+            normalized_error = (
+                expected_scale - gt_scales.type_as(expected_scale)
+            ) / step
+            regression_loss = F.smooth_l1_loss(
+                normalized_error,
+                torch.zeros_like(normalized_error),
+                beta=1.0,
+                reduction="mean",
+            )
+            total_loss = (
+                total_loss
+                + self.cross_attention_reg_loss_weight * regression_loss
+            )
+
+        if (
+                self.cross_attention_ttc_loss_weight > 0.0
+                and gt_ttcs is not None
+                and frame_gap is not None
+        ):
+            ttc_loss = self.get_ttc_metric_loss(
+                expected_scale, gt_ttcs, frame_gap
+            )
+            total_loss = (
+                total_loss
+                + self.cross_attention_ttc_loss_weight * ttc_loss
+            )
+        return total_loss
+
+    def get_fps_tensor(self, frame_gap, reference):
+        if isinstance(frame_gap, (list, tuple)):
+            gap = torch.as_tensor(
+                frame_gap, dtype=reference.dtype, device=reference.device
+            ).view(-1)
+        elif torch.is_tensor(frame_gap):
+            gap = frame_gap.to(
+                device=reference.device, dtype=reference.dtype
+            ).view(-1)
+        else:
+            gap = torch.full_like(reference.view(-1), float(frame_gap))
+        if gap.numel() == 1 and reference.numel() != 1:
+            gap = gap.expand(reference.numel())
+        return 10.0 / gap.clamp_min(1.0)
+
+    def get_ttc_metric_sample_weights(self, gt_ttcs, device, dtype):
+        gt_abs = torch.as_tensor(
+            gt_ttcs, device=device, dtype=dtype
+        ).view(-1).abs()
+        weights = torch.full_like(gt_abs, self.ttc_metric_short_loss_weight)
+        weights = torch.where(
+            gt_abs >= self.ttc_metric_mid_ttc_abs_thresh,
+            torch.full_like(weights, self.ttc_metric_mid_loss_weight),
+            weights,
+        )
+        weights = torch.where(
+            gt_abs >= self.ttc_metric_long_ttc_abs_thresh,
+            torch.full_like(weights, self.ttc_metric_long_loss_weight),
+            weights,
+        )
+        if self.ttc_metric_tail_ttc_abs_thresh > 0:
+            weights = torch.where(
+                gt_abs >= self.ttc_metric_tail_ttc_abs_thresh,
+                torch.full_like(weights, self.ttc_metric_tail_loss_weight),
+                weights,
+            )
+        return weights
+
+    def get_ttc_metric_loss(self, pred_scales, gt_ttcs, frame_gap):
+        pred_scales = pred_scales.view(-1).clamp_min(1e-6)
+        gt_ttcs = torch.as_tensor(
+            gt_ttcs, device=pred_scales.device, dtype=pred_scales.dtype
+        ).view(-1)
+        fps = self.get_fps_tensor(frame_gap, pred_scales)
+        pred_ttcs = scale_ratio_to_ttc(pred_scales, fps=fps)
+        pred_ttcs = pred_ttcs.clamp(-self.ttc_metric_clip, self.ttc_metric_clip)
+        gt_ttcs = gt_ttcs.clamp(-self.ttc_metric_clip, self.ttc_metric_clip)
+        denominator = gt_ttcs.abs().clamp_min(self.ttc_metric_min_denom)
+        relative_delta = (pred_ttcs - gt_ttcs) / denominator
+        abs_delta = relative_delta.abs()
+        beta = self.ttc_metric_huber_beta
+        loss = torch.where(
+            abs_delta < beta,
+            0.5 * abs_delta.square() / beta,
+            abs_delta - 0.5 * beta,
+        )
+        weights = self.get_ttc_metric_sample_weights(
+            gt_ttcs, pred_scales.device, pred_scales.dtype
+        )
+        return (loss * weights).sum() / weights.sum().clamp_min(1e-12)
+
+    def shift_split(self, ref_features):
+        """Split a context ROI into the same local shifts used by the baseline."""
+        windows = []
+        for row in range(self.shift_kernel_size):
+            for col in range(self.shift_kernel_size):
+                windows.append(
+                    ref_features[:, :, row:row + self.grid_size, col:col + self.grid_size]
+                )
+        return torch.stack(windows, dim=1)
 
     def gt_to_one_hot(self, gts, gap, scale_list, ref_tensor=None):
         if ref_tensor is not None:

@@ -22,7 +22,7 @@ class Exp(BaseExp):
     def __init__(self):
         super().__init__()
         self.archi_name = 'TTCBase'
-        self.head_type = 'scale_regression'
+        self.head_type = 'distribution'
         # ---------------- model config ---------------- #
         # random seed
         self.seed = 0
@@ -75,15 +75,41 @@ class Exp(BaseExp):
         self.normalize_similarity = False
         self.similarity_topk_ratio = 0.05
         self.similarity_topk_weight = 0.0
-        # direct cross-attention TTC head: predicts scale/TTC logits without per-scale ROI Align enumeration
+        # Native-resolution target-Q/reference-KV cross-attention head.
         self.use_cross_attention_head = True
-        self.cross_attention_grid_size = 32
+        self.cross_attention_grid_size = 24
         self.cross_attention_position_sigma = 0.35
         self.cross_attention_heads = 4
-        # "ref_to_target" uses ref tokens as Q and target tokens as K/V; "scale_query" keeps the previous scale-query head.
-        self.cross_attention_mode = "ref_to_target"
-        # 0 means use the backbone channel count; set 64/128 to increase head capacity.
-        self.cross_attention_dim = 0
+        # "dense_qkv" does not use ROI Align or spatial downsampling.
+        self.cross_attention_mode = "dense_qkv"
+        self.cross_attention_window_size = 3
+        self.cross_attention_dilations = (1, 3, 6)
+        self.cross_attention_dropout = 0.0
+        self.dense_attention_context_scale = 1.0
+        self.dense_attention_align_centers = True
+        self.cross_attention_residual_init = 0.0
+        self.cross_attention_geometry_sigma = 0.08
+        self.cross_attention_geometry_weight = 0.0
+        self.cross_attention_reg_loss_weight = 0.25
+        self.cross_attention_ttc_loss_weight = 1.0
+        self.ttc_metric_clip = 20.0
+        self.ttc_metric_min_denom = 1.0
+        self.ttc_metric_huber_beta = 0.1
+        self.ttc_metric_short_loss_weight = 0.1
+        self.ttc_metric_mid_ttc_abs_thresh = 3.0
+        self.ttc_metric_mid_loss_weight = 0.5
+        self.ttc_metric_long_ttc_abs_thresh = 6.0
+        self.ttc_metric_long_loss_weight = 0.85
+        self.ttc_metric_tail_ttc_abs_thresh = 12.0
+        self.ttc_metric_tail_loss_weight = 1.0
+        # Wider projections prevent four heads from collapsing to six channels each.
+        self.cross_attention_dim = 96
+        # Fine-tuning switches; enable both when loading a strong baseline checkpoint.
+        self.freeze_backbone = False
+        self.freeze_scale_head = False
+        # Keep the strong checkpoint features stable while allowing the final
+        # backbone stage to adapt to dense correspondence learning.
+        self.backbone_lr_scale = 0.1
 
         # ---------------- dataloader config ---------------- #
         # set worker to 8 for shorter dataloader init time
@@ -103,6 +129,9 @@ class Exp(BaseExp):
         self.min_size_after_padding = 300
         # downsample by 2x if the box size is larger than this value |box level only|
         self.box_downsample_thresh = 300  # [300,300]
+        # dense_qkv keeps every crop pixel; dot_product keeps the official
+        # 300-pixel downsampling rule so baseline evaluation remains comparable.
+        self.preserve_dense_crop_resolution = True
         # padding img size when cropping
         self.receptive_filed = 32
         # use NeRF data or not
@@ -149,7 +178,8 @@ class Exp(BaseExp):
         self.min_lr_ratio = 0.01
         # learning rate for one image. During training, lr will multiply batchsize.
         self.basic_lr_per_img = 5e-4
-        # name of LRScheduler
+        # optimizer and scheduler; AdamW is useful for attention-only fine-tuning.
+        self.optimizer_name = "sgd"
         self.scheduler = "yoloxwarmcos"
         # last #epoch to close augmention like mosaic
         self.no_aug_epochs = 8
@@ -224,7 +254,27 @@ class Exp(BaseExp):
                        cross_attention_position_sigma=self.cross_attention_position_sigma,
                        cross_attention_dim=(self.cross_attention_dim if self.cross_attention_dim > 0 else None),
                        cross_attention_heads=self.cross_attention_heads,
-                       cross_attention_mode=self.cross_attention_mode)
+                       cross_attention_mode=self.cross_attention_mode,
+                       cross_attention_window_size=self.cross_attention_window_size,
+                       cross_attention_dilations=self.cross_attention_dilations,
+                       cross_attention_dropout=self.cross_attention_dropout,
+                       dense_attention_context_scale=self.dense_attention_context_scale,
+                       dense_attention_align_centers=self.dense_attention_align_centers,
+                       cross_attention_residual_init=self.cross_attention_residual_init,
+                       cross_attention_geometry_sigma=self.cross_attention_geometry_sigma,
+                       cross_attention_geometry_weight=self.cross_attention_geometry_weight,
+                       cross_attention_reg_loss_weight=self.cross_attention_reg_loss_weight,
+                       cross_attention_ttc_loss_weight=self.cross_attention_ttc_loss_weight,
+                       ttc_metric_clip=self.ttc_metric_clip,
+                       ttc_metric_min_denom=self.ttc_metric_min_denom,
+                       ttc_metric_huber_beta=self.ttc_metric_huber_beta,
+                       ttc_metric_short_loss_weight=self.ttc_metric_short_loss_weight,
+                       ttc_metric_mid_ttc_abs_thresh=self.ttc_metric_mid_ttc_abs_thresh,
+                       ttc_metric_mid_loss_weight=self.ttc_metric_mid_loss_weight,
+                       ttc_metric_long_ttc_abs_thresh=self.ttc_metric_long_ttc_abs_thresh,
+                       ttc_metric_long_loss_weight=self.ttc_metric_long_loss_weight,
+                       ttc_metric_tail_ttc_abs_thresh=self.ttc_metric_tail_ttc_abs_thresh,
+                       ttc_metric_tail_loss_weight=self.ttc_metric_tail_loss_weight)
 
         def init_model(M):
             for m in M.modules():
@@ -235,6 +285,13 @@ class Exp(BaseExp):
         self.model = TTCNet(backbone, head)
 
         self.model.apply(init_model)
+        self.model.freeze_backbone = bool(self.freeze_backbone)
+        if self.freeze_backbone:
+            for param in self.model.backbone.parameters():
+                param.requires_grad = False
+        if self.freeze_scale_head:
+            for param in self.model.head.scale_preds.parameters():
+                param.requires_grad = False
 
         return self.model
 
@@ -270,29 +327,82 @@ class Exp(BaseExp):
 
     def get_optimizer(self, batch_size):
         if "optimizer" not in self.__dict__:
-            if self.warmup_epochs > 0:
-                lr = self.warmup_lr
-            else:
-                lr = self.basic_lr_per_img * batch_size
-
-            pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
-
-            for k, v in self.model.named_modules():
-                if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
-                    pg2.append(v.bias)  # biases
-                if isinstance(v, nn.BatchNorm2d) or "bn" in k:
-                    pg0.append(v.weight)  # no decay
-                elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
-                    pg1.append(v.weight)  # apply decay
-
-            optimizer = torch.optim.SGD(
-                pg0, lr=lr, momentum=self.momentum, nesterov=True
+            lr = (
+                self.warmup_lr
+                if self.warmup_epochs > 0
+                else self.basic_lr_per_img * batch_size
             )
-            optimizer.add_param_group(
-                {"params": pg1, "weight_decay": self.weight_decay}
-            )  # add pg1 with weight_decay
-            optimizer.add_param_group({"params": pg2})
-            self.optimizer = optimizer
+            no_decay, decay, biases = [], [], []
+
+            for name, module in self.model.named_modules():
+                if (
+                        hasattr(module, "bias")
+                        and isinstance(module.bias, nn.Parameter)
+                        and module.bias.requires_grad
+                ):
+                    biases.append(module.bias)
+                if (
+                        hasattr(module, "weight")
+                        and isinstance(module.weight, nn.Parameter)
+                        and module.weight.requires_grad
+                ):
+                    if isinstance(module, (nn.BatchNorm2d, nn.LayerNorm)) or "bn" in name:
+                        no_decay.append(module.weight)
+                    else:
+                        decay.append(module.weight)
+
+            grouped_ids = {id(param) for param in no_decay + decay + biases}
+            for _, param in self.model.named_parameters():
+                if param.requires_grad and id(param) not in grouped_ids:
+                    no_decay.append(param)
+                    grouped_ids.add(id(param))
+
+            param_groups = []
+            parameter_names = {
+                id(param): name for name, param in self.model.named_parameters()
+            }
+            backbone_lr_scale = max(float(self.backbone_lr_scale), 0.0)
+
+            def add_groups(parameters, weight_decay):
+                backbone_parameters, head_parameters = [], []
+                for parameter in parameters:
+                    name = parameter_names[id(parameter)]
+                    if name.startswith("backbone."):
+                        backbone_parameters.append(parameter)
+                    else:
+                        head_parameters.append(parameter)
+                for values, lr_scale in (
+                        (backbone_parameters, backbone_lr_scale),
+                        (head_parameters, 1.0),
+                ):
+                    if values and lr_scale > 0.0:
+                        param_groups.append({
+                            "params": values,
+                            "weight_decay": weight_decay,
+                            "lr": lr * lr_scale,
+                            "lr_scale": lr_scale,
+                        })
+
+            add_groups(no_decay, 0.0)
+            add_groups(decay, self.weight_decay)
+            add_groups(biases, 0.0)
+            if not param_groups:
+                raise ValueError("No trainable parameters remain after applying freeze options.")
+
+            optimizer_name = str(self.optimizer_name).lower()
+            if optimizer_name == "adamw":
+                self.optimizer = torch.optim.AdamW(param_groups, lr=lr)
+            elif optimizer_name == "sgd":
+                self.optimizer = torch.optim.SGD(
+                    param_groups,
+                    lr=lr,
+                    momentum=self.momentum,
+                    nesterov=True,
+                )
+            else:
+                raise ValueError(
+                    "Unsupported optimizer_name: {}".format(self.optimizer_name)
+                )
 
         return self.optimizer
 
@@ -329,6 +439,14 @@ class Exp(BaseExp):
                 )
             )
 
+    def get_box_downsample_thresh(self):
+        if (
+                self.preserve_dense_crop_resolution
+                and str(self.cross_attention_mode).lower() == "dense_qkv"
+        ):
+            return 0
+        return self.box_downsample_thresh
+
     def get_eval_loader(self, batch_size, is_distributed, testdev=False, legacy=False,
                         data_path=None, anno_path=None):
         self._check_dataset_path(data_path, "valset_dir")
@@ -340,7 +458,8 @@ class Exp(BaseExp):
         valArgs = {
             'data_path': data_path, 'anno_path': anno_path, 'img_size': self.test_size, 'preproc': ValTransform(),
             'seq_len': self.sequence_len, 'first_last': not self.use_all, 'training': False,
-            'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
+            'receptive_filed': self.receptive_filed,
+            'box_downsample_thresh': self.get_box_downsample_thresh(),
             'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
             'default_max_scale':self.max_scale,
             'grid_size':self.grid_size,
@@ -380,7 +499,8 @@ class Exp(BaseExp):
                 'data_path': self.trainset_dir, 'anno_path': self.trainAnnoPath, 'img_size': self.test_size,
                 'preproc': TrainTransform(hsv_prob=self.hsv_prob),
                 'seq_len': self.sequence_len, 'first_last': not self.use_all, 'training': True,
-                'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
+                'receptive_filed': self.receptive_filed,
+                'box_downsample_thresh': self.get_box_downsample_thresh(),
                 'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
                 'default_max_scale': self.max_scale,
                 'grid_size': self.grid_size,

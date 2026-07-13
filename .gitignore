@@ -23,3 +23,8 @@ TTC_outputs/
 cuda_ops/build/
 cuda_ops/dist/
 cuda_ops/*.egg-info/
+
+# Local datasets, experiment artifacts, and generated checkpoints
+outputs/
+ssh_data/
+weights/Deep_TTC_distribution50_best.pth

@@ -11,6 +11,12 @@ class TTCNet(nn.Module):
         self.backbone = backbone
         self.head = head
 
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and getattr(self, "freeze_backbone", False):
+            self.backbone.eval()
+        return self
+
     def forward(self, x, input_box_list, dictAnnos=None, ttc_gts=None,):
 
         backbone_outs = self.backbone(x)

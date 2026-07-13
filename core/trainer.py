@@ -109,7 +109,7 @@ class Trainer:
         lr = self.lr_scheduler.update_lr(self.progress_in_iter + 1)
         self.lr = lr
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+            param_group["lr"] = lr * param_group.get("lr_scale", 1.0)
 
         iter_end_time = time.time()
         self.meter.update(

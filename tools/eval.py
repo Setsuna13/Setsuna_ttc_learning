@@ -12,7 +12,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import os
 from exp.build import get_exp
-from core.auxil import setup_logger
+from core.auxil import setup_logger, load_ckpt
 from core.launch import launch
 from core.auxil import configure_nccl,configure_omp,configure_module,get_num_devices,get_local_rank
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -47,6 +47,11 @@ def make_parser():
         "--resume", default=False, action="store_true", help="resume training"
     )
     parser.add_argument("-c", "--ckpt", default='' , type=str, help="checkpoint file")
+    parser.add_argument(
+        "--allow-partial-load",
+        action="store_true",
+        help="load matching tensors for dot_product baseline evaluation only",
+    )
     parser.add_argument("--dataset", default='val', type=str,
                         help="dataset for evaluation")
     parser.add_argument(
@@ -144,14 +149,23 @@ def main(exp, args, num_gpu):
     logger.info("loading checkpoint from {}".format(ckpt_file))
     loc = "cuda:{}".format(rank)
     ckpt = torch.load(ckpt_file, map_location=loc)
-    try:
-        model.load_state_dict(ckpt["model"])
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Checkpoint is not compatible with the current direct cross-attention head. "
-            "Evaluate a checkpoint trained with this head, or fine-tune from an old baseline "
-            "checkpoint via tools/train.py -c <old_ckpt> so the new head parameters are initialized and trained."
-        ) from exc
+    if args.allow_partial_load:
+        if str(exp.cross_attention_mode).lower() != "dot_product":
+            raise ValueError(
+                "--allow-partial-load is restricted to dot_product baseline evaluation. "
+                "A dense_qkv checkpoint must be loaded strictly so random attention "
+                "parameters cannot be evaluated by mistake."
+            )
+        model = load_ckpt(model, ckpt["model"])
+    else:
+        try:
+            model.load_state_dict(ckpt["model"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Checkpoint is not strictly compatible with the selected model. "
+                "Use --allow-partial-load only when evaluating an old checkpoint "
+                "through the dot_product baseline."
+            ) from exc
     logger.info("loaded checkpoint done.")
     if is_distributed:
         model = DDP(model, device_ids=[rank])

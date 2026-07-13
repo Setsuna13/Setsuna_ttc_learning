@@ -667,7 +667,15 @@ class TTCHead(nn.Module):
                 k_map, window, dilation=dilation
             )
             key_patch = F.normalize(key_patch, p=2, dim=-1, eps=1e-6)
-            logits.append((q.unsqueeze(-2) * key_patch).sum(dim=-1))
+            # Use batched matrix multiplication instead of materialising the
+            # broadcast product [B, heads, tokens, keys, head_dim].  The latter
+            # can require several GiB for native-resolution crops even though
+            # the reduced logits are small.
+            logits.append(
+                torch.matmul(
+                    q.unsqueeze(-2), key_patch.transpose(-1, -2)
+                ).squeeze(-2)
+            )
         attention_logits = torch.cat(logits, dim=-1)
         attention_logits = (
             attention_logits * logit_scale.exp().clamp(1.0, 20.0)
@@ -704,9 +712,13 @@ class TTCHead(nn.Module):
             branch_attention = dropped_attention[
                 ..., start:start + branch_keys
             ]
-            context = context + (
-                branch_attention.unsqueeze(-1) * value_patch
-            ).sum(dim=-2)
+            # As above, avoid a keys-by-head_dim broadcast temporary during
+            # value aggregation.  This is algebraically identical to the
+            # elementwise product followed by sum over the key dimension.
+            branch_context = torch.matmul(
+                branch_attention.unsqueeze(-2), value_patch
+            ).squeeze(-2)
+            context = context + branch_context
         return attention_weights, context
 
     def unfold_native_local_heads(self, feature_map, window, dilation=1):

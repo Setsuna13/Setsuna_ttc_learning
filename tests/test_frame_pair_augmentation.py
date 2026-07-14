@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from unittest import mock
 
 import numpy as np
 import torch
@@ -164,6 +166,26 @@ class FramePairAugmentationTest(unittest.TestCase):
         self.assertEqual(exp.crop_padding_value, 127)
         self.assertEqual(exp.train_epoch_size_multiplier, 1.0)
         self.assertEqual(exp.data_num_workers, 4)
+
+    def test_validation_dataset_uses_the_same_boundary_padding(self):
+        exp = AugExp()
+        fake_dataset = mock.MagicMock()
+        fake_dataset.__len__.return_value = 1
+
+        with tempfile.TemporaryDirectory() as dataset_dir:
+            with mock.patch("exp.Deep_TTC.TSTTCDataset", return_value=fake_dataset) as dataset_cls:
+                with mock.patch("exp.Deep_TTC.get_ttc_loader", return_value="loader"):
+                    loader = exp.get_eval_loader(
+                        batch_size=4,
+                        is_distributed=False,
+                        data_path=dataset_dir,
+                        anno_path=dataset_dir,
+                    )
+
+        self.assertEqual(loader, "loader")
+        val_args = dataset_cls.call_args[1]
+        self.assertTrue(val_args["pad_outside_crop"])
+        self.assertEqual(val_args["crop_padding_value"], 127)
 
 
 if __name__ == "__main__":

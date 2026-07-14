@@ -118,7 +118,7 @@ value.
 3. fills only the out-of-image region with value `127`;
 4. shifts the ROI coordinates into that padded canvas.
 
-This replaces the legacy `return None` behavior and avoids NumPy negative-index wraparound. The baseline `Deep_TTC.py` keeps padding disabled for reproduction compatibility.
+This replaces the legacy `return None` behavior and avoids NumPy negative-index wraparound. The augmentation experiment applies the same crop rule to training and validation, so edge objects are not silently omitted from either split. The baseline `Deep_TTC.py` keeps padding disabled for reproduction compatibility.
 
 On a smoke test using 20 real training annotation files (1,505 sequences and 45,150 bidirectional frame-pair samples), the legacy boundary rule rejected 194 samples. Padding retained all 45,150 geometrically valid samples. Corrupt images and non-finite or zero-area annotation boxes are still rejected because they do not contain usable training evidence.
 
@@ -168,7 +168,7 @@ If `reverse_aug_append true reverse_aug_prob 1` is also used, those 5 forward pa
 
 ## Validation
 
-Validation remains fixed to the first-last pair, preserving direct comparability with the original protocol and avoiding duplicate annotation IDs in evaluation output.
+Validation remains fixed to the first-last pair, preserving the original temporal protocol and avoiding duplicate annotation IDs in evaluation output. In `Deep_TTC_Aug.py`, only the invalid boundary-crop behavior changes: the requested area is padded instead of dropping the validation sample.
 
 ## Relevant Configs
 

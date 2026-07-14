@@ -403,6 +403,8 @@ class Exp(BaseExp):
             'default_max_scale':self.max_scale,
             'grid_size':self.grid_size,
             'training_data_ratio': self.val_data_ratio,
+            'pad_outside_crop': self.pad_outside_crop,
+            'crop_padding_value': self.crop_padding_value,
             'use_robust_box_crop': self.use_robust_box_crop,
             'robust_box_occ_thresh': self.robust_box_occ_thresh,
             'robust_box_area_ratio_thresh': self.robust_box_area_ratio_thresh,

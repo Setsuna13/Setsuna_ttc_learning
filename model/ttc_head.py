@@ -1,6 +1,7 @@
 from torch import nn
 from .network_blocks import FocalLoss
 from torchvision.ops import roi_align
+import math
 import torch
 import torch.nn.functional as F
 from data.ttc_dataset import ttc_to_scale_ratio, scale_ratio_to_ttc
@@ -41,6 +42,7 @@ class TTCHead(nn.Module):
             scale_bin_mode = "linear",
             scale_bin_density_power = 2.5,
             scale_bin_center = 1.0,
+            frame_gap_scale_ranges = None,
             use_ttc_metric_loss = False,
             ttc_metric_loss_weight = 1.0,
             ttc_metric_clip = 20.0,
@@ -95,6 +97,9 @@ class TTCHead(nn.Module):
         self.scale_bin_mode = str(scale_bin_mode)
         self.scale_bin_density_power = max(float(scale_bin_density_power), 1.0)
         self.scale_bin_center = float(scale_bin_center)
+        self.frame_gap_scale_ranges = self._validate_frame_gap_scale_ranges(
+            frame_gap_scale_ranges
+        )
         self.use_ttc_metric_loss = bool(use_ttc_metric_loss)
         self.ttc_metric_loss_weight = float(ttc_metric_loss_weight)
         self.ttc_metric_clip = float(ttc_metric_clip)
@@ -112,6 +117,74 @@ class TTCHead(nn.Module):
             nn.init.zeros_(self.residual_preds.weight)
             nn.init.zeros_(self.residual_preds.bias)
 
+    @staticmethod
+    def _validate_frame_gap_scale_ranges(scale_ranges):
+        if scale_ranges is None or len(scale_ranges) == 0:
+            return ()
+        validated = []
+        for frame_gap, bounds in enumerate(scale_ranges, start=1):
+            if len(bounds) != 2:
+                raise ValueError(
+                    "frame-gap {} scale range must contain [min, max]".format(
+                        frame_gap
+                    )
+                )
+            min_scale, max_scale = float(bounds[0]), float(bounds[1])
+            if not math.isfinite(min_scale) or not math.isfinite(max_scale):
+                raise ValueError("frame-gap scale ranges must be finite")
+            if min_scale <= 0 or max_scale <= min_scale:
+                raise ValueError(
+                    "invalid frame-gap {} scale range: {}".format(
+                        frame_gap, bounds
+                    )
+                )
+            validated.append((min_scale, max_scale))
+        return tuple(validated)
+
+    def _normalize_frame_gaps(self, frame_gap, sample_count, device=None):
+        if frame_gap is None:
+            frame_gap = self.sequence_len - 1
+        gaps = torch.as_tensor(frame_gap, dtype=torch.long, device=device).view(-1)
+        if gaps.numel() == 1 and sample_count != 1:
+            gaps = gaps.expand(sample_count)
+        if gaps.numel() != sample_count:
+            raise ValueError(
+                "frame_gap count {} does not match box count {}".format(
+                    gaps.numel(), sample_count
+                )
+            )
+        if self.frame_gap_scale_ranges:
+            if bool((gaps < 1).any()) or bool(
+                (gaps > len(self.frame_gap_scale_ranges)).any()
+            ):
+                raise ValueError(
+                    "frame gaps must be within [1, {}], got {}".format(
+                        len(self.frame_gap_scale_ranges), gaps.tolist()
+                    )
+                )
+        return gaps
+
+    @staticmethod
+    def _scale_matrix(scale_list, sample_count, device, dtype):
+        scale_list = torch.as_tensor(scale_list, device=device, dtype=dtype)
+        if scale_list.ndim == 1:
+            return scale_list.view(1, -1).expand(sample_count, -1)
+        if scale_list.ndim != 2:
+            raise ValueError(
+                "scale_list must be 1D or 2D, got shape {}".format(
+                    tuple(scale_list.shape)
+                )
+            )
+        if scale_list.shape[0] == 1 and sample_count != 1:
+            return scale_list.expand(sample_count, -1)
+        if scale_list.shape[0] != sample_count:
+            raise ValueError(
+                "scale-list rows {} do not match sample count {}".format(
+                    scale_list.shape[0], sample_count
+                )
+            )
+        return scale_list
+
     def forward(self, xin, tar_boxes,ref_boxes,ttc_imu =None,**kwargs):
         '''
 
@@ -123,7 +196,18 @@ class TTCHead(nn.Module):
 
         C,H,W = xin.shape[-3:]
         G,S,Box = self.grid_size,self.scale_number, tar_boxes.shape[0]
-        scale_list = self.get_scale_list(S)
+        dict_annos = kwargs.get('dictAnnos')
+        if dict_annos is not None:
+            frame_gap = dict_annos.get('frame_gap', self.sequence_len - 1)
+        else:
+            frame_gap = self.sequence_len - 1
+        scale_list = self.get_scale_list(
+            S,
+            frame_gap=frame_gap,
+            sample_count=Box,
+            device=ref_boxes.device,
+            dtype=ref_boxes.dtype,
+        )
         ref_boxes,tar_boxes = self.boxes_sample(ref_boxes,tar_boxes,scale_list,H,W)
         ref_boxes,tar_boxes = ref_boxes.type_as(xin),tar_boxes.type_as(xin)
         tar_features = roi_align(xin[1::2, ], tar_boxes, (G, G))
@@ -164,11 +248,6 @@ class TTCHead(nn.Module):
             )
         if self.training:
             if self.head_type == "distribution":
-                dict_annos = kwargs.get('dictAnnos')
-                if dict_annos is not None:
-                    frame_gap = dict_annos['frame_gap']
-                else:
-                    frame_gap = self.sequence_len - 1
                 scale_gts = None if dict_annos is None else dict_annos.get('scale_gt')
                 gt_scales = self.prepare_targets(
                     ttc_imu, frame_gap, scale_gts=scale_gts
@@ -188,7 +267,7 @@ class TTCHead(nn.Module):
                         residual_logits, gt_scales, scale_list, base_probs.detach(), sample_weights
                     )
                     final_scale_loss = self.get_weighted_scale_loss(
-                        pred_scales, gt_scales, sample_weights
+                        pred_scales, gt_scales, sample_weights, scale_list
                     )
                     total_loss = (
                         total_loss
@@ -203,11 +282,6 @@ class TTCHead(nn.Module):
                 return total_loss
 
             predictions = predictions.view(-1,1)
-            dict_annos = kwargs.get('dictAnnos')
-            if dict_annos is not None:
-                frame_gap = dict_annos['frame_gap']
-            else:
-                frame_gap = self.sequence_len-1
             scale_gts = None if dict_annos is None else dict_annos.get('scale_gt')
             gt_one_hot = self.gt_to_one_hot(
                 ttc_imu, gap=frame_gap, scale_list=scale_list, scale_gts=scale_gts
@@ -266,14 +340,20 @@ class TTCHead(nn.Module):
         return torch.tensor(scale_gt)
 
     def get_distribution_loss(self, logits, gt_scales, scale_list):
-        scale_list = scale_list.to(device=logits.device, dtype=logits.dtype)
+        scale_matrix = self._scale_matrix(
+            scale_list, logits.shape[0], logits.device, logits.dtype
+        )
         gt_scales = gt_scales.to(device=logits.device, dtype=logits.dtype).view(-1)
-        gt_scales = gt_scales.clamp(scale_list[0], scale_list[-1])
+        gt_scales = torch.maximum(
+            torch.minimum(gt_scales, scale_matrix[:, -1]), scale_matrix[:, 0]
+        )
 
-        idx_r = torch.searchsorted(scale_list, gt_scales, right=False).clamp(1, self.scale_number - 1)
+        idx_r = (scale_matrix < gt_scales.view(-1, 1)).sum(dim=1)
+        idx_r = idx_r.clamp(1, self.scale_number - 1)
         idx_l = (idx_r - 1).clamp(0, self.scale_number - 1)
-        scale_l = scale_list[idx_l]
-        scale_r = scale_list[idx_r]
+        row_idx = torch.arange(logits.shape[0], device=logits.device)
+        scale_l = scale_matrix[row_idx, idx_l]
+        scale_r = scale_matrix[row_idx, idx_r]
         weight_r = (gt_scales - scale_l) / (scale_r - scale_l).clamp_min(1e-12)
         weight_r = weight_r.clamp(0.0, 1.0)
         weight_l = 1.0 - weight_r
@@ -284,9 +364,11 @@ class TTCHead(nn.Module):
         return (loss_l * weight_l + loss_r * weight_r).mean()
 
     def apply_distribution_prediction(self, logits, scale_list):
-        scale_list = scale_list.to(device=logits.device, dtype=logits.dtype)
+        scale_matrix = self._scale_matrix(
+            scale_list, logits.shape[0], logits.device, logits.dtype
+        )
         probs = F.softmax(logits, dim=-1)
-        pred_scales = torch.sum(probs * scale_list.view(1, -1), dim=-1)
+        pred_scales = torch.sum(probs * scale_matrix, dim=-1)
         return pred_scales, probs
 
     def get_fps_tensor(self, frame_gap, reference):
@@ -351,11 +433,13 @@ class TTCHead(nn.Module):
         )
 
     def apply_per_bin_residual(self, base_logits, residual_logits, scale_list):
-        scale_list = scale_list.to(device=base_logits.device, dtype=base_logits.dtype)
+        scale_matrix = self._scale_matrix(
+            scale_list, base_logits.shape[0], base_logits.device, base_logits.dtype
+        )
         residual_list = self.get_residual_list(base_logits.device, base_logits.dtype)
         base_probs = F.softmax(base_logits, dim=-1)
         residual_probs = F.softmax(residual_logits, dim=-1)
-        corrected_scales = scale_list.view(1, -1, 1) + residual_list.view(1, 1, -1)
+        corrected_scales = scale_matrix.unsqueeze(-1) + residual_list.view(1, 1, -1)
         corrected_scales = corrected_scales.clamp_min(1e-6)
         pred_scales = (base_probs.unsqueeze(-1) * residual_probs * corrected_scales).sum(dim=(1, 2))
         return pred_scales, base_probs
@@ -383,16 +467,33 @@ class TTCHead(nn.Module):
             )
         return weights
 
-    def get_weighted_scale_loss(self, pred_scales, gt_scales, sample_weights):
+    def get_weighted_scale_loss(self, pred_scales, gt_scales, sample_weights, scale_list=None):
         pred_scales = pred_scales.view(-1)
         gt_scales = gt_scales.to(device=pred_scales.device, dtype=pred_scales.dtype).view(-1)
         sample_weights = sample_weights.to(device=pred_scales.device, dtype=pred_scales.dtype).view(-1)
-        scale_step = max((self.max_scale - self.min_scale) / max(self.scale_number - 1, 1), 1e-6)
+        if scale_list is None:
+            scale_step = torch.full_like(
+                pred_scales,
+                max((self.max_scale - self.min_scale) / max(self.scale_number - 1, 1), 1e-6),
+            )
+        else:
+            scale_matrix = self._scale_matrix(
+                scale_list, pred_scales.numel(), pred_scales.device, pred_scales.dtype
+            )
+            scale_step = (
+                (scale_matrix[:, -1] - scale_matrix[:, 0])
+                / max(self.scale_number - 1, 1)
+            ).clamp_min(1e-6)
         loss = torch.abs(pred_scales - gt_scales) / scale_step
         return (loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-12)
 
     def get_per_bin_residual_loss(self, residual_logits, gt_scales, scale_list, bin_weights, sample_weights=None):
-        scale_list = scale_list.to(device=residual_logits.device, dtype=residual_logits.dtype)
+        scale_matrix = self._scale_matrix(
+            scale_list,
+            residual_logits.shape[0],
+            residual_logits.device,
+            residual_logits.dtype,
+        )
         gt_scales = gt_scales.to(device=residual_logits.device, dtype=residual_logits.dtype).view(-1, 1)
         bin_weights = bin_weights.to(device=residual_logits.device, dtype=residual_logits.dtype)
         if sample_weights is None:
@@ -400,7 +501,7 @@ class TTCHead(nn.Module):
         else:
             sample_weights = sample_weights.to(device=residual_logits.device, dtype=residual_logits.dtype).view(-1)
 
-        residual_targets = (gt_scales - scale_list.view(1, -1)).clamp(
+        residual_targets = (gt_scales - scale_matrix).clamp(
             -self.residual_scale_range, self.residual_scale_range
         )
         step = (2.0 * self.residual_scale_range) / (self.residual_bin_num - 1)
@@ -432,47 +533,91 @@ class TTCHead(nn.Module):
             scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / tmp_gap) for ttc,tmp_gap in zip(gts,gap)]
         else:
             scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / gap) for ttc in gts]
-        scale_number,gt_number,range_list = self.scale_number,len(gts),scale_list
-        if torch.is_tensor(range_list):
-            range_tensor = range_list.detach().clone().view([-1, scale_number])
-        else:
-            range_tensor = torch.tensor(range_list).view([-1, scale_number])
-        range_tensor = range_tensor.repeat(gt_number, 1)
-        gts_tensor = torch.tensor(scale_gt).view(gt_number, -1).repeat([1, scale_number]).type_as(range_tensor)
+        scale_number,gt_number = self.scale_number,len(gts)
+        range_device = scale_list.device if torch.is_tensor(scale_list) else torch.device("cpu")
+        range_dtype = scale_list.dtype if torch.is_tensor(scale_list) else torch.float32
+        range_tensor = self._scale_matrix(
+            scale_list, gt_number, device=range_device, dtype=range_dtype
+        )
+        gts_tensor = torch.as_tensor(
+            scale_gt, device=range_tensor.device, dtype=range_tensor.dtype
+        ).view(gt_number, 1).expand(-1, scale_number)
 
         ones_mat = torch.ones_like(gts_tensor)
         zero_mat = torch.zeros_like(ones_mat)
         dist_mat = torch.abs(range_tensor - gts_tensor)
-        min_bin = self.smoother_factor*(self.max_scale - self.min_scale) / (self.scale_number - 1)
-        dist_tensor = torch.where(dist_mat > min_bin, zero_mat, min_bin - dist_mat) * (1 / min_bin)
+        min_bin = self.smoother_factor * (
+            (range_tensor[:, -1] - range_tensor[:, 0]) / (self.scale_number - 1)
+        ).clamp_min(1e-12).view(-1, 1)
+        dist_tensor = torch.where(dist_mat > min_bin, zero_mat, min_bin - dist_mat) / min_bin
         gt_one_hot = dist_tensor.view(-1, 1)
         return gt_one_hot
 
-    def get_scale_list(self, S):
+    def get_scale_list(self, S, frame_gap=None, sample_count=None, device=None, dtype=None):
+        if dtype is None:
+            dtype = torch.float32
+        if self.frame_gap_scale_ranges:
+            if sample_count is None:
+                sample_count = torch.as_tensor(frame_gap).numel()
+            gaps = self._normalize_frame_gaps(frame_gap, sample_count, device=device)
+            all_bounds = torch.tensor(
+                self.frame_gap_scale_ranges, device=device, dtype=dtype
+            )
+            bounds = all_bounds[gaps - 1]
+            if self.scale_bin_mode.lower() in ("linear", "uniform"):
+                unit = torch.linspace(0.0, 1.0, S, device=device, dtype=dtype)
+                return bounds[:, :1] + (bounds[:, 1:] - bounds[:, :1]) * unit.view(1, -1)
+            if self.scale_bin_mode.lower() in (
+                "center_dense", "ttc_aware", "ttc_aware_center_dense"
+            ):
+                return torch.stack(
+                    [
+                        self.get_center_dense_scale_list(
+                            S,
+                            min_scale=float(cur_bounds[0]),
+                            max_scale=float(cur_bounds[1]),
+                            device=device,
+                            dtype=dtype,
+                        )
+                        for cur_bounds in bounds.detach().cpu()
+                    ],
+                    dim=0,
+                )
+            raise ValueError(
+                "Unsupported scale_bin_mode: {}".format(self.scale_bin_mode)
+            )
         mode = self.scale_bin_mode.lower()
         if mode in ("linear", "uniform"):
-            return torch.linspace(self.min_scale, self.max_scale, S)
+            return torch.linspace(self.min_scale, self.max_scale, S, device=device, dtype=dtype)
         if mode in ("center_dense", "ttc_aware", "ttc_aware_center_dense"):
-            return self.get_center_dense_scale_list(S)
+            return self.get_center_dense_scale_list(S, device=device, dtype=dtype)
         raise ValueError("Unsupported scale_bin_mode: {}".format(self.scale_bin_mode))
 
-    def get_center_dense_scale_list(self, S):
+    def get_center_dense_scale_list(
+        self, S, min_scale=None, max_scale=None, device=None, dtype=None
+    ):
+        if min_scale is None:
+            min_scale = self.min_scale
+        if max_scale is None:
+            max_scale = self.max_scale
+        if dtype is None:
+            dtype = torch.float32
         if S <= 2:
-            return torch.linspace(self.min_scale, self.max_scale, S)
-        center = min(max(self.scale_bin_center, self.min_scale + 1e-6), self.max_scale - 1e-6)
-        left_range = center - self.min_scale
-        right_range = self.max_scale - center
+            return torch.linspace(min_scale, max_scale, S, device=device, dtype=dtype)
+        center = min(max(self.scale_bin_center, min_scale + 1e-6), max_scale - 1e-6)
+        left_range = center - min_scale
+        right_range = max_scale - center
         total_range = left_range + right_range
         if left_range <= 0 or right_range <= 0 or total_range <= 0:
-            return torch.linspace(self.min_scale, self.max_scale, S)
+            return torch.linspace(min_scale, max_scale, S, device=device, dtype=dtype)
 
         left_bins = int(round((S - 1) * left_range / total_range)) + 1
         left_bins = min(max(left_bins, 2), S - 1)
         right_bins = S - left_bins + 1
         power = self.scale_bin_density_power
 
-        left_u = torch.linspace(0.0, 1.0, left_bins)
-        right_u = torch.linspace(0.0, 1.0, right_bins)
+        left_u = torch.linspace(0.0, 1.0, left_bins, device=device, dtype=dtype)
+        right_u = torch.linspace(0.0, 1.0, right_bins, device=device, dtype=dtype)
         left = center - left_range * torch.pow(1.0 - left_u, power)
         right = center + right_range * torch.pow(right_u, power)
         return torch.cat([left, right[1:]], dim=0)

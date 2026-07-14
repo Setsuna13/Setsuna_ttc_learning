@@ -94,7 +94,11 @@ class TTCEvaluator:
                     else:
                         pred_conf, pred_bin = torch.topk(outputs, k=topk, dim=-1)
                         pred_conf = pred_conf / torch.clamp(pred_conf.sum(dim=-1, keepdim=True), min=1e-12)
-                        pred_scales = torch.sum(scale_list[pred_bin] * pred_conf, dim=-1)
+                        if scale_list.ndim == 1:
+                            selected_scales = scale_list[pred_bin]
+                        else:
+                            selected_scales = torch.gather(scale_list, 1, pred_bin)
+                        pred_scales = torch.sum(selected_scales * pred_conf, dim=-1)
                 else:
                     pred_scales = pred_scales.reshape(-1).type_as(outputs)
 

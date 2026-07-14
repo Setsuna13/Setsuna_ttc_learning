@@ -74,6 +74,7 @@ class TSTTCDataset(torchDataset):
             training_data_ratio = 1.0,
             expand_ratio = 1.1,
             default_max_scale = 1.25,
+            frame_gap_scale_ranges=None,
             nerf_path=None,
             nerf_seqs = 0,
             nerf_seed = 0,
@@ -151,12 +152,49 @@ class TSTTCDataset(torchDataset):
 
         self.expand_ratio = expand_ratio
         self.default_max_scale = default_max_scale
+        self.frame_gap_scale_ranges = self._validate_frame_gap_scale_ranges(
+            frame_gap_scale_ranges
+        )
         self.grid_size = kwargs.get('grid_size',50)
         self.base_sequence_count = len(self.annos)
         self._compact_pair_specs = None
         self._compact_directions_per_pair = 1
         self._sample_count = 0
         self.sample_index = self._build_sample_index()
+
+    @staticmethod
+    def _validate_frame_gap_scale_ranges(scale_ranges):
+        if scale_ranges is None or len(scale_ranges) == 0:
+            return ()
+        validated = []
+        for frame_gap, bounds in enumerate(scale_ranges, start=1):
+            if len(bounds) != 2:
+                raise ValueError(
+                    "frame-gap {} scale range must contain [min, max]".format(
+                        frame_gap
+                    )
+                )
+            min_scale, max_scale = float(bounds[0]), float(bounds[1])
+            if not np.isfinite(min_scale) or not np.isfinite(max_scale):
+                raise ValueError("frame-gap scale ranges must be finite")
+            if min_scale <= 0 or max_scale <= min_scale:
+                raise ValueError(
+                    "invalid frame-gap {} scale range: {}".format(
+                        frame_gap, bounds
+                    )
+                )
+            validated.append((min_scale, max_scale))
+        return tuple(validated)
+
+    def _max_scale_for_gap(self, frame_gap):
+        if not self.frame_gap_scale_ranges:
+            return self.default_max_scale
+        frame_gap = int(frame_gap)
+        if frame_gap < 1 or frame_gap > len(self.frame_gap_scale_ranges):
+            raise ValueError(
+                "frame gap {} has no configured scale range".format(frame_gap)
+            )
+        return self.frame_gap_scale_ranges[frame_gap - 1][1]
 
     def _build_sample_index(self):
         if self.whole_img:
@@ -418,7 +456,8 @@ class TSTTCDataset(torchDataset):
                             'fail to load image pair: %s or %s' % (objAnnoRef['img_path'], objAnnoCur['img_path']))
                         return result_dict
                     result_dict['imgPair'].extend([imgRef,imgCur])
-                max_scale = self.default_max_scale
+                frame_gap = self.seq_len-ref_idx-1
+                max_scale = self._max_scale_for_gap(frame_gap)
                 seq = frameSeq[i][-self.seq_len:]
                 ref_box, cur_box = self._pair_boxes_for_crop(seq, 0, self.seq_len - 1, False, objAnnoRef, objAnnoCur)
                 candidate_boxes = get_crop_size(
@@ -432,7 +471,6 @@ class TSTTCDataset(torchDataset):
                     result_dict['refBoxAnnos'].append(candidate_boxes[0])
                     result_dict['curBoxAnnos'].append(candidate_boxes[3])
                     result_dict['ttc_imu'].append(objAnnoCur['ttc_imu'])
-                    frame_gap = self.seq_len-ref_idx-1
                     fps = self.frame_rate / float(frame_gap)
                     result_dict['scale_gt'].append(float(ttc_to_scale_ratio(objAnnoCur['ttc_imu'], fps=fps)))
                     result_dict['curAnnos'].append(objAnnoCur)
@@ -457,7 +495,7 @@ class TSTTCDataset(torchDataset):
                 logger.warning('fail to load image pair: %s or %s'%(objAnnoRef['img_path'],objAnnoCur['img_path']))
                 return result_dict
 
-            max_scale = self.default_max_scale
+            max_scale = self._max_scale_for_gap(frame_gap)
             ref_box, cur_box = self._pair_boxes_for_crop(seq, ref_pos, cur_pos, reverse_pair, objAnnoRef, objAnnoCur)
             candidate_boxes = get_crop_size(
                 ref_box,

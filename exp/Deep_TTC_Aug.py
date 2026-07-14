@@ -33,11 +33,14 @@ class Exp(BaseExp):
         self.train_epoch_size_multiplier = 1.0
         self.data_num_workers = 4
 
-        # Close the scale interval under inversion. The original [0.65, 1.5]
-        # interval becomes [0.65, 1 / 0.65] for bidirectional supervision.
-        base_min_scale = self.min_scale
-        base_max_scale = self.max_scale
-        self.min_scale = min(base_min_scale, 1.0 / base_max_scale)
-        self.max_scale = max(base_max_scale, 1.0 / base_min_scale)
+        # Use the original range assigned to each frame gap, then close every
+        # interval under inversion for ref/target swapping. A mixed batch gets
+        # one 50-bin scale grid per sample instead of sharing the gap-5 grid.
+        self.frame_gap_scale_ranges = [
+            [min(low, 1.0 / high), max(high, 1.0 / low)]
+            for low, high in self.min_max_scale_list
+        ]
+        self.min_scale = min(bounds[0] for bounds in self.frame_gap_scale_ranges)
+        self.max_scale = max(bounds[1] for bounds in self.frame_gap_scale_ranges)
 
         self.exp_name = "Deep_TTC_all_frames_bidirectional"

@@ -167,6 +167,83 @@ class FramePairAugmentationTest(unittest.TestCase):
         self.assertEqual(exp.train_epoch_size_multiplier, 1.0)
         self.assertEqual(exp.data_num_workers, 4)
 
+    def test_each_frame_gap_has_a_reciprocal_closed_scale_range(self):
+        exp = AugExp()
+
+        self.assertEqual(len(exp.frame_gap_scale_ranges), 5)
+        for original, augmented in zip(
+            exp.min_max_scale_list, exp.frame_gap_scale_ranges
+        ):
+            original_min, original_max = original
+            augmented_min, augmented_max = augmented
+            self.assertAlmostEqual(
+                augmented_min, min(original_min, 1.0 / original_max)
+            )
+            self.assertAlmostEqual(
+                augmented_max, max(original_max, 1.0 / original_min)
+            )
+
+    def test_head_builds_one_scale_grid_per_frame_gap(self):
+        exp = AugExp()
+        head = TTCHead(
+            scale_number=5,
+            min_scale=exp.min_scale,
+            max_scale=exp.max_scale,
+            frame_gap_scale_ranges=exp.frame_gap_scale_ranges,
+            scale_bin_mode="linear",
+        )
+
+        scale_grids = head.get_scale_list(
+            5, frame_gap=[1, 2, 3, 4, 5], sample_count=5
+        )
+
+        self.assertEqual(tuple(scale_grids.shape), (5, 5))
+        expected_ranges = torch.tensor(exp.frame_gap_scale_ranges)
+        self.assertTrue(torch.allclose(scale_grids[:, 0], expected_ranges[:, 0]))
+        self.assertTrue(torch.allclose(scale_grids[:, -1], expected_ranges[:, 1]))
+        self.assertLess(
+            float(scale_grids[0, 1] - scale_grids[0, 0]),
+            float(scale_grids[4, 1] - scale_grids[4, 0]),
+        )
+
+    def test_dynamic_scale_grid_is_used_by_loss_and_prediction(self):
+        exp = AugExp()
+        head = TTCHead(
+            scale_number=5,
+            min_scale=exp.min_scale,
+            max_scale=exp.max_scale,
+            frame_gap_scale_ranges=exp.frame_gap_scale_ranges,
+        )
+        scale_grids = head.get_scale_list(
+            5, frame_gap=[1, 5], sample_count=2
+        )
+        logits = torch.full((2, 5), -20.0, requires_grad=True)
+        with torch.no_grad():
+            logits[0, 1] = 20.0
+            logits[1, 3] = 20.0
+        targets = torch.stack([scale_grids[0, 1], scale_grids[1, 3]])
+
+        loss = head.get_distribution_loss(logits, targets, scale_grids)
+        predictions, _ = head.apply_distribution_prediction(logits, scale_grids)
+        loss.backward()
+
+        self.assertLess(float(loss), 1e-6)
+        self.assertTrue(torch.allclose(predictions, targets, atol=1e-6))
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_dataset_crop_range_follows_frame_gap(self):
+        exp = AugExp()
+        dataset = make_dataset()
+        dataset.default_max_scale = exp.max_scale
+        dataset.frame_gap_scale_ranges = dataset._validate_frame_gap_scale_ranges(
+            exp.frame_gap_scale_ranges
+        )
+
+        for frame_gap, bounds in enumerate(exp.frame_gap_scale_ranges, start=1):
+            self.assertAlmostEqual(
+                dataset._max_scale_for_gap(frame_gap), bounds[1]
+            )
+
     def test_validation_dataset_uses_the_same_boundary_padding(self):
         exp = AugExp()
         fake_dataset = mock.MagicMock()
@@ -186,6 +263,9 @@ class FramePairAugmentationTest(unittest.TestCase):
         val_args = dataset_cls.call_args[1]
         self.assertTrue(val_args["pad_outside_crop"])
         self.assertEqual(val_args["crop_padding_value"], 127)
+        self.assertEqual(
+            val_args["frame_gap_scale_ranges"], exp.frame_gap_scale_ranges
+        )
 
 
 if __name__ == "__main__":

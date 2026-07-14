@@ -44,6 +44,9 @@ class Exp(BaseExp):
         ###Note: change the min and max scale manually when using different sequence len!!!
         self.min_scale = self.min_max_scale_list[self.sequence_len - 2][0]
         self.max_scale = self.min_max_scale_list[self.sequence_len - 2][1]
+        # Optional per-frame-gap scale ranges. An empty list preserves the
+        # original fixed-range behavior; the all-pairs experiment enables it.
+        self.frame_gap_scale_ranges = []
         # kernel size for conv layer in model
         self.ksize_base = 7
         # n*n center shift
@@ -262,6 +265,7 @@ class Exp(BaseExp):
                        scale_bin_mode=self.scale_bin_mode,
                        scale_bin_density_power=self.scale_bin_density_power,
                        scale_bin_center=self.scale_bin_center,
+                       frame_gap_scale_ranges=self.frame_gap_scale_ranges,
                        use_ttc_metric_loss=self.use_ttc_metric_loss,
                        ttc_metric_loss_weight=self.ttc_metric_loss_weight,
                        ttc_metric_clip=self.ttc_metric_clip,
@@ -401,6 +405,7 @@ class Exp(BaseExp):
             'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
             'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
             'default_max_scale':self.max_scale,
+            'frame_gap_scale_ranges': self.frame_gap_scale_ranges,
             'grid_size':self.grid_size,
             'training_data_ratio': self.val_data_ratio,
             'pad_outside_crop': self.pad_outside_crop,
@@ -450,6 +455,7 @@ class Exp(BaseExp):
                 'receptive_filed': self.receptive_filed, 'box_downsample_thresh': self.box_downsample_thresh,
                 'min_size_after_padding': self.min_size_after_padding, 'whole_img': not self.box_level,
                 'default_max_scale': self.max_scale,
+                'frame_gap_scale_ranges': self.frame_gap_scale_ranges,
                 'grid_size': self.grid_size,
                 'training_data_ratio': self.training_data_ratio,
                 'use_all_frame_pairs': self.use_all or self.use_all_frame_pairs,

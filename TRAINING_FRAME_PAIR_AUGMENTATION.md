@@ -59,7 +59,25 @@ The dataset passes `scale_gt` directly to the head, so `s_forward * s_reverse ==
 | `reciprocal_scale` | TTC is back-computed | Scale is exactly `1 / original_scale` | Bidirectional training |
 | `sign` | `T -> -T` | Recomputed from sign-flipped TTC | Legacy ablation only |
 
-`exp/Deep_TTC_Aug.py` selects `reciprocal_scale` and expands the scale-bin interval so it is closed under inversion.
+`exp/Deep_TTC_Aug.py` selects `reciprocal_scale` and closes every frame-gap-specific scale-bin interval under inversion.
+
+## Frame-Gap-Specific Scale Grids
+
+The original ranges are indexed by frame gap. Mixed-gap training now preserves
+that design instead of assigning the widest gap-5 grid to every sample. Each
+object in a batch receives its own 50-bin grid:
+
+| Frame gap | Original range | Bidirectional closed range |
+| ---: | ---: | ---: |
+| 1 | `[0.90, 1.08]` | `[0.90, 1.1111]` |
+| 2 | `[0.80, 1.20]` | `[0.80, 1.25]` |
+| 3 | `[0.75, 1.25]` | `[0.75, 1.3333]` |
+| 4 | `[0.70, 1.40]` | `[0.70, 1.4286]` |
+| 5 | `[0.65, 1.50]` | `[0.65, 1.5385]` |
+
+The selected range is used consistently for crop context, ROI scale sampling,
+distribution targets, and scale prediction. Short-gap samples therefore have
+finer scale resolution without giving up exact reciprocal labels.
 
 ## Recommended Command
 

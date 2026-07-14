@@ -125,6 +125,12 @@ def main(exp, args, num_gpu):
 
     cudnn.benchmark = True
     model = exp.get_model()
+    evaluator = exp.get_evaluator(args.batch_size, is_distributed)
+    # Start persistent workers before CUDA initialization. Forking a worker
+    # after model.cuda() can segfault inside libtorch on this environment.
+    _eval_worker_bootstrap = None
+    if getattr(evaluator.dataloader, "num_workers", 0) > 0:
+        _eval_worker_bootstrap = iter(evaluator.dataloader)
     file_name = os.path.join(exp.output_dir, args.experiment_name)
     if rank == 0:
         os.makedirs(file_name, exist_ok=True)
@@ -134,7 +140,6 @@ def main(exp, args, num_gpu):
     torch.cuda.set_device(rank)
     model.cuda(rank)
     model.eval()
-    evaluator = exp.get_evaluator(args.batch_size, is_distributed)
     ckpt_file = args.ckpt
     logger.info("loading checkpoint from {}".format(ckpt_file))
     loc = "cuda:{}".format(rank)

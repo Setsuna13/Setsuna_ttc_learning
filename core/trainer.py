@@ -1,4 +1,5 @@
 import datetime
+import math
 import os
 import time
 from loguru import logger
@@ -90,21 +91,43 @@ class Trainer:
     def train_one_iter(self):
         iter_start_time = time.time()
 
-        inps, dictAnnos, enlarge_boxes, ttc = self.prefetcher.next()
-        if inps is None: return
-        if ttc.shape[0] == 0:return
+        max_empty_batch_retries = max(
+            1, int(getattr(self.exp, "max_empty_batch_retries", 50))
+        )
+        for retry in range(max_empty_batch_retries):
+            inps, dictAnnos, enlarge_boxes, ttc = self.prefetcher.next()
+            if inps is not None and ttc is not None and ttc.numel() > 0:
+                break
+            if retry == 0:
+                logger.warning(
+                    "Encountered an empty training batch; fetching the next batch."
+                )
+        else:
+            raise RuntimeError(
+                "No valid training batch found after {} attempts. Check image files "
+                "and annotation boxes.".format(max_empty_batch_retries)
+            )
 
         inps = inps.to(self.data_type)
         self.seq_size = inps.shape[-2:]
         data_end_time = time.time()
+        self.optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=self.amp_training):
             outputs = self.model(inps, enlarge_boxes, dictAnnos, ttc)
             loss = outputs["total_loss"]
-            if loss < 200:
-                self.optimizer.zero_grad()
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+        if not torch.isfinite(loss).all():
+            raise FloatingPointError(
+                "non-finite training loss at epoch {}, iter {}: {}".format(
+                    self.epoch + 1, self.iter + 1, loss.detach().cpu().item()
+                )
+            )
+        self.scaler.scale(loss).backward()
+        grad_clip_norm = float(getattr(self.exp, "grad_clip_norm", 0.0))
+        if grad_clip_norm > 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
 
         lr = self.lr_scheduler.update_lr(self.progress_in_iter + 1)
         self.lr = lr
@@ -123,6 +146,19 @@ class Trainer:
         logger.info("args: {}".format(self.args))
         logger.info("exp value:\n{}".format(self.exp))
 
+        # Spawn persistent DataLoader workers before CUDA is initialized. Forking
+        # after model.to(cuda) can segfault inside libtorch in worker processes.
+        self.train_loader = self.exp.get_data_loader(
+            batch_size=self.args.batch_size,
+            is_distributed=self.is_distributed,
+        )
+        self.evaluator = self.exp.get_evaluator(
+            batch_size=self.args.batch_size, is_distributed=self.is_distributed
+        )
+        train_loader_iter = iter(self.train_loader)
+        if getattr(self.train_loader, "num_workers", 0) > 0:
+            self._eval_worker_bootstrap = iter(self.evaluator.dataloader)
+
         # model related init
         torch.cuda.set_device(self.local_rank)
         model = self.exp.get_model()
@@ -133,15 +169,46 @@ class Trainer:
         # value of epoch will be set in `resume_train`
         model = self.resume_train(model)
 
-        # data related init
-        self.train_loader = self.exp.get_data_loader(
-            batch_size=self.args.batch_size,
-            is_distributed=self.is_distributed,
-        )
         logger.info("init prefetcher, this might take minutes or less...")
-        self.prefetcher = DataPrefetcher(self.train_loader)
-        # max_iter means iters per epoch
-        self.max_iter = len(self.train_loader)
+        self.prefetcher = DataPrefetcher(train_loader_iter)
+        natural_max_iter = len(self.train_loader)
+        epoch_size_multiplier = float(
+            getattr(self.exp, "train_epoch_size_multiplier", 0.0)
+        )
+        if epoch_size_multiplier > 0:
+            base_sample_count = getattr(
+                self.train_loader.dataset, "base_sequence_count", len(self.train_loader.dataset)
+            )
+            epoch_sample_count = max(
+                1, int(math.ceil(base_sample_count * epoch_size_multiplier))
+            )
+            local_epoch_sample_count = int(
+                math.ceil(epoch_sample_count / float(max(get_world_size(), 1)))
+            )
+            loader_batch_size = getattr(
+                self.train_loader.batch_sampler,
+                "batch_size",
+                self.args.batch_size,
+            )
+            self.max_iter = min(
+                natural_max_iter,
+                max(
+                    1,
+                    int(
+                        math.ceil(
+                            local_epoch_sample_count / float(loader_batch_size)
+                        )
+                    ),
+                ),
+            )
+        else:
+            epoch_sample_count = len(self.train_loader.dataset)
+            self.max_iter = natural_max_iter
+        logger.info(
+            "Training index: {:,} samples; epoch budget: {:,} samples / {:,} iterations".format(
+                len(self.train_loader.dataset), epoch_sample_count, self.max_iter
+            )
+        )
 
         self.lr_scheduler = self.exp.get_lr_scheduler(
             self.exp.basic_lr_per_img * self.args.batch_size, self.max_iter
@@ -152,10 +219,6 @@ class Trainer:
 
 
         self.model = model
-
-        self.evaluator = self.exp.get_evaluator(
-            batch_size=self.args.batch_size, is_distributed=self.is_distributed
-        )
 
         # Tensorboard and Wandb loggers
         if self.rank == 0:
@@ -254,6 +317,8 @@ class Trainer:
             # resume the model/optimizer state dict
             model.load_state_dict(ckpt["model"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
+            if "scaler" in ckpt:
+                self.scaler.load_state_dict(ckpt["scaler"])
             self.best_rte = ckpt.pop("best_rte", 1)
             # resume the training states variables
             start_epoch = (
@@ -313,6 +378,7 @@ class Trainer:
                 "start_epoch": self.epoch + 1,
                 "model": save_model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
+                "scaler": self.scaler.state_dict(),
                 "best_rte": self.best_rte,
             }
             save_checkpoint(

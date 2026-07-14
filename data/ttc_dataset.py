@@ -2,7 +2,6 @@ import copy
 import os
 import random
 import pickle
-import uuid
 import itertools
 from loguru import logger
 
@@ -153,17 +152,42 @@ class TSTTCDataset(torchDataset):
         self.expand_ratio = expand_ratio
         self.default_max_scale = default_max_scale
         self.grid_size = kwargs.get('grid_size',50)
+        self.base_sequence_count = len(self.annos)
+        self._compact_pair_specs = None
+        self._compact_directions_per_pair = 1
+        self._sample_count = 0
         self.sample_index = self._build_sample_index()
 
     def _build_sample_index(self):
         if self.whole_img:
             return []
         rng = random.Random(0)
-        sample_index = []
         pair_specs = self._get_pair_specs()
+        samples_pairs = 0 < self.frame_pair_sample_num < len(pair_specs)
+        stochastic_append = (
+            self.training
+            and self.reverse_aug_append
+            and 0 < self.reverse_aug_prob < 1
+        )
+        if not samples_pairs and not stochastic_append:
+            self._compact_pair_specs = pair_specs
+            if (
+                self.training
+                and self.reverse_aug_append
+                and self.reverse_aug_prob >= 1
+            ):
+                self._compact_directions_per_pair = 2
+            self._sample_count = (
+                len(self.annos)
+                * len(pair_specs)
+                * self._compact_directions_per_pair
+            )
+            return None
+
+        sample_index = []
         for anno_idx in range(len(self.annos)):
             cur_pair_specs = pair_specs
-            if 0 < self.frame_pair_sample_num < len(pair_specs):
+            if samples_pairs:
                 cur_pair_specs = rng.sample(pair_specs, self.frame_pair_sample_num)
             for ref_pos, cur_pos in cur_pair_specs:
                 sample_index.append((anno_idx, ref_pos, cur_pos, False))
@@ -174,6 +198,7 @@ class TSTTCDataset(torchDataset):
                     and rng.random() < self.reverse_aug_prob
                 ):
                     sample_index.append((anno_idx, ref_pos, cur_pos, True))
+        self._sample_count = len(sample_index)
         return sample_index
 
     def _get_pair_specs(self):
@@ -186,10 +211,17 @@ class TSTTCDataset(torchDataset):
         return [(0, self.seq_len - 1)]
 
     def _get_indexed_pair(self, index):
-        if self.sample_index:
+        if self.sample_index is not None:
             anno_idx, ref_pos, cur_pos, reverse_pair = self.sample_index[index]
         else:
-            anno_idx, ref_pos, cur_pos, reverse_pair = index, 0, self.seq_len - 1, False
+            pair_index, direction = divmod(
+                index, self._compact_directions_per_pair
+            )
+            anno_idx, pair_offset = divmod(
+                pair_index, len(self._compact_pair_specs)
+            )
+            ref_pos, cur_pos = self._compact_pair_specs[pair_offset]
+            reverse_pair = bool(direction)
         if (
             self.training
             and not self.reverse_aug_append
@@ -346,7 +378,7 @@ class TSTTCDataset(torchDataset):
     def __len__(self):
         if self.whole_img:
             return len(self.tsttc.frameSeqs)
-        return len(self.sample_index)
+        return self._sample_count
 
     def resize_img(self, img,):
         r = min(self.img_size[0] / img.shape[0], self.img_size[1] / img.shape[1])
@@ -901,6 +933,9 @@ def get_ttc_loader(batchSize,data_num_workers,dataset,is_dist = False,seed=0):
         "batch_sampler": sampler,
         "collate_fn": ttc_collate_fn
     }
+    if data_num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = 2
 
     # Make sure each process has different random seed, especially for 'fork' method.
     # Check https://github.com/pytorch/pytorch/issues/63311 for more details.
@@ -911,7 +946,8 @@ def get_ttc_loader(batchSize,data_num_workers,dataset,is_dist = False,seed=0):
     return ttc_loader
 
 def worker_init_reset_seed(worker_id):
-    seed = uuid.uuid4().int % 2**32
+    # PyTorch has already assigned a distinct worker seed. Calling
+    # torch.manual_seed() here can touch libtorch/CUDA state in a forked worker.
+    seed = torch.initial_seed() % 2**32
     random.seed(seed)
-    torch.set_rng_state(torch.manual_seed(seed).get_state())
     np.random.seed(seed)

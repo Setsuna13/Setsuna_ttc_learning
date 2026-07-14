@@ -176,6 +176,14 @@ class Exp(BaseExp):
         self.robust_box_center_shift_thresh = 0.0
 
         # --------------  training config --------------------- #
+        # 0 uses the full indexed dataset per epoch. A positive value limits
+        # each epoch to this multiple of the original sequence count while the
+        # infinite sampler continues across epoch boundaries.
+        self.train_epoch_size_multiplier = 0.0
+        # Optional gradient clipping; 0 keeps it disabled.
+        self.grad_clip_norm = 0.0
+        # Fail clearly if consecutive batches contain no usable samples.
+        self.max_empty_batch_retries = 50
         # epoch number used for warmup
         self.warmup_epochs = 3
         # max training epoch

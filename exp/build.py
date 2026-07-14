@@ -4,15 +4,29 @@
 import importlib
 import os
 import sys
-sys.path.append("..")
+sys.path.insert(0, os.getcwd())
+
+
 def get_exp_by_file(exp_file):
     try:
-        #sys.path.append(os.path.dirname(exp_file))
-        file_name = exp_file[:-3].replace('/','.')
-        current_exp = importlib.import_module(file_name)
+        exp_path = os.path.abspath(os.path.normpath(exp_file))
+        module_parts = [os.path.splitext(os.path.basename(exp_path))[0]]
+        package_dir = os.path.dirname(exp_path)
+        import_root = package_dir
+        while os.path.isfile(os.path.join(package_dir, "__init__.py")):
+            module_parts.insert(0, os.path.basename(package_dir))
+            import_root = os.path.dirname(package_dir)
+            package_dir = import_root
+        if import_root not in sys.path:
+            sys.path.insert(0, import_root)
+        current_exp = importlib.import_module(".".join(module_parts))
         exp = current_exp.Exp()
-    except Exception:
-        raise ImportError("{} doesn't contains class named 'Exp'".format(exp_file))
+    except Exception as exc:
+        raise ImportError(
+            "{} doesn't contain a loadable class named 'Exp': {}".format(
+                exp_file, exc
+            )
+        )
     return exp
 
 
@@ -30,4 +44,3 @@ def get_exp(exp_file=None, exp_name=None):
     ), "plz provide exp file or exp name."
     if exp_file is not None:
         return get_exp_by_file(exp_file)
-

@@ -108,6 +108,10 @@ class MeterBuffer(defaultdict):
         for k, v in values.items():
             if isinstance(v, torch.Tensor):
                 v = v.detach()
+                if v.numel() == 1:
+                    v = v.item()
+                else:
+                    v = v.cpu().numpy()
             self[k].update(v)
 
     def clear_meters(self):

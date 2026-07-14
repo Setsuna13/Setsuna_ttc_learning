@@ -75,6 +75,40 @@ python tools/train.py \
 
 This produces 30 indexed training samples per original 6-frame sequence: 15 temporal pairs times 2 directions. Validation remains unchanged.
 
+The augmented index is computed from the requested sample number instead of
+materializing one Python tuple per sample. The logical dataset is still 30
+times larger, but its index memory stays essentially constant.
+
+## Epoch Budget
+
+`Deep_TTC_Aug.py` sets `train_epoch_size_multiplier=1.0`. One epoch therefore
+contains the same number of samples as the original first-last dataset instead
+of becoming 30 times longer. The infinite shuffled sampler continues from its
+current position across epoch boundaries:
+
+```text
+1 augmented epoch  = 1 x original sequence count
+30 augmented epochs = all 30 directed frame pairs covered once
+36 augmented epochs = about 1.2 passes over the full augmented index
+```
+
+This keeps the optimizer steps, warmup, cosine schedule, checkpoint cadence,
+and total runtime comparable to the original 36-epoch configuration while
+still guaranteeing that every directed pair is reached during training.
+
+Set `train_epoch_size_multiplier=0` to consume the complete 30-times-larger
+index in every epoch. That is substantially more training and is not the
+recommended default.
+
+## DataLoader Stability
+
+Training and validation workers are started before CUDA model initialization
+and remain persistent. This avoids forking worker processes after CUDA has been
+initialized, which can otherwise cause a segmentation fault in
+`libtorch_cpu.so`. The augmentation experiment uses four workers by default;
+override `data_num_workers` if host RAM or CPU throughput requires a different
+value.
+
 ## Boundary Crop Retention
 
 `Deep_TTC_Aug.py` enables `pad_outside_crop=true`. When an enlarged ROI crosses an image boundary, the loader now:

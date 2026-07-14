@@ -26,6 +26,13 @@ class Exp(BaseExp):
         self.pad_outside_crop = True
         self.crop_padding_value = 127
 
+        # Keep the optimizer/scheduler epoch comparable to the original
+        # first-last training budget. The infinite sampler still traverses all
+        # 30 augmented variants across 30 epochs instead of making every epoch
+        # 30 times longer.
+        self.train_epoch_size_multiplier = 1.0
+        self.data_num_workers = 4
+
         # Close the scale interval under inversion. The original [0.65, 1.5]
         # interval becomes [0.65, 1 / 0.65] for bidirectional supervision.
         base_min_scale = self.min_scale

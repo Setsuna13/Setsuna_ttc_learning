@@ -38,6 +38,10 @@ class DataPrefetcher:
         ttc = self.next_ttc
         if input is not None:
             self.record_stream(input)
+        if enlarge_boxes is not None:
+            self.record_stream(enlarge_boxes)
+        if ttc is not None:
+            self.record_stream(ttc)
 
         self.preload()
 
@@ -46,6 +50,10 @@ class DataPrefetcher:
     def _input_cuda_for_image(self):
         if self.next_input is not  None:
             self.next_input = self.next_input.cuda(non_blocking=True)
+        if self.enlarge_boxes is not None:
+            self.enlarge_boxes = self.enlarge_boxes.cuda(non_blocking=True)
+        if self.next_ttc is not None:
+            self.next_ttc = self.next_ttc.cuda(non_blocking=True)
 
     @staticmethod
     def _record_stream_for_image(input):

@@ -1,7 +1,9 @@
 import sys
 import os
 o_path = os.getcwd()
-sys.path.append(o_path)
+if o_path in sys.path:
+    sys.path.remove(o_path)
+sys.path.insert(0, o_path)
 
 import argparse
 import random

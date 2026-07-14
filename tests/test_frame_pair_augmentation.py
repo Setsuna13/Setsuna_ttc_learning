@@ -21,6 +21,10 @@ def make_dataset(reverse_ttc_mode="reciprocal_scale"):
     dataset.reverse_ttc_mode = reverse_ttc_mode
     dataset.frame_rate = 10.0
     dataset.annos = [None]
+    dataset._compact_pair_specs = None
+    dataset._compact_directions_per_pair = 1
+    dataset._sample_count = 0
+    dataset.sample_index = dataset._build_sample_index()
     return dataset
 
 
@@ -36,15 +40,24 @@ class FramePairAugmentationTest(unittest.TestCase):
 
     def test_forward_and_reverse_samples_are_both_indexed(self):
         dataset = make_dataset()
-        sample_index = dataset._build_sample_index()
 
-        self.assertEqual(len(sample_index), 30)
-        for offset in range(0, len(sample_index), 2):
-            forward = sample_index[offset]
-            reverse = sample_index[offset + 1]
+        self.assertIsNone(dataset.sample_index)
+        self.assertEqual(len(dataset), 30)
+        for offset in range(0, len(dataset), 2):
+            forward = dataset._get_indexed_pair(offset)
+            reverse = dataset._get_indexed_pair(offset + 1)
             self.assertEqual(forward[:3], reverse[:3])
             self.assertFalse(forward[3])
             self.assertTrue(reverse[3])
+
+    def test_large_augmented_index_is_computed_without_python_tuple_list(self):
+        dataset = make_dataset()
+        dataset.annos = [None] * 10000
+        dataset.sample_index = dataset._build_sample_index()
+
+        self.assertIsNone(dataset.sample_index)
+        self.assertEqual(len(dataset), 300000)
+        self.assertEqual(dataset._get_indexed_pair(299999), (9999, 4, 5, True))
 
     def test_swapped_pair_has_exact_reciprocal_scale_target(self):
         dataset = make_dataset()
@@ -149,6 +162,8 @@ class FramePairAugmentationTest(unittest.TestCase):
 
         self.assertTrue(exp.pad_outside_crop)
         self.assertEqual(exp.crop_padding_value, 127)
+        self.assertEqual(exp.train_epoch_size_multiplier, 1.0)
+        self.assertEqual(exp.data_num_workers, 4)
 
 
 if __name__ == "__main__":

@@ -164,11 +164,15 @@ class TTCHead(nn.Module):
             )
         if self.training:
             if self.head_type == "distribution":
-                if 'dictAnnos' in kwargs:
-                    frame_gap = kwargs['dictAnnos']['frame_gap']
+                dict_annos = kwargs.get('dictAnnos')
+                if dict_annos is not None:
+                    frame_gap = dict_annos['frame_gap']
                 else:
                     frame_gap = self.sequence_len - 1
-                gt_scales = self.prepare_targets(ttc_imu, frame_gap).type_as(predictions)
+                scale_gts = None if dict_annos is None else dict_annos.get('scale_gt')
+                gt_scales = self.prepare_targets(
+                    ttc_imu, frame_gap, scale_gts=scale_gts
+                ).type_as(predictions)
                 distribution_loss = self.get_distribution_loss(predictions, gt_scales, scale_list)
                 total_loss = distribution_loss
                 pred_scales = None
@@ -199,12 +203,15 @@ class TTCHead(nn.Module):
                 return total_loss
 
             predictions = predictions.view(-1,1)
-            if 'dictAnnos' in kwargs:
-                dictAnnos = kwargs['dictAnnos']
-                frame_gap = dictAnnos['frame_gap']
+            dict_annos = kwargs.get('dictAnnos')
+            if dict_annos is not None:
+                frame_gap = dict_annos['frame_gap']
             else:
                 frame_gap = self.sequence_len-1
-            gt_one_hot = self.gt_to_one_hot(ttc_imu, gap=frame_gap,scale_list=scale_list)
+            scale_gts = None if dict_annos is None else dict_annos.get('scale_gt')
+            gt_one_hot = self.gt_to_one_hot(
+                ttc_imu, gap=frame_gap, scale_list=scale_list, scale_gts=scale_gts
+            )
             scale_loss = self.get_loss(predictions, gt_one_hot)
             return scale_loss
         if self.head_type == "distribution":
@@ -241,7 +248,15 @@ class TTCHead(nn.Module):
         _, gt_bin = torch.max(gts, -1, keepdim=False)
         return scale_loss
 
-    def prepare_targets(self, gts, gap):
+    def prepare_targets(self, gts, gap, scale_gts=None):
+        if scale_gts is not None and len(scale_gts) > 0:
+            if len(scale_gts) != len(gts):
+                raise ValueError(
+                    "scale_gt count {} does not match TTC count {}".format(
+                        len(scale_gts), len(gts)
+                    )
+                )
+            return torch.as_tensor(scale_gts, dtype=torch.float32).view(-1)
         if isinstance(gap, (list, tuple)):
             scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / float(tmp_gap)) for ttc, tmp_gap in zip(gts, gap)]
         elif torch.is_tensor(gap):
@@ -404,8 +419,16 @@ class TTCHead(nn.Module):
         weights = bin_weights * sample_weights.view(-1, 1)
         return (residual_loss * weights).sum() / weights.sum().clamp_min(1e-12)
 
-    def gt_to_one_hot(self, gts, gap, scale_list):
-        if type(gap) is list:
+    def gt_to_one_hot(self, gts, gap, scale_list, scale_gts=None):
+        if scale_gts is not None and len(scale_gts) > 0:
+            if len(scale_gts) != len(gts):
+                raise ValueError(
+                    "scale_gt count {} does not match TTC count {}".format(
+                        len(scale_gts), len(gts)
+                    )
+                )
+            scale_gt = scale_gts
+        elif type(gap) is list:
             scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / tmp_gap) for ttc,tmp_gap in zip(gts,gap)]
         else:
             scale_gt = [ttc_to_scale_ratio(ttc, fps=10 / gap) for ttc in gts]

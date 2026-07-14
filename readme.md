@@ -140,7 +140,7 @@ For the 6-frame pair and reverse TTC augmentation, see [TRAINING_FRAME_PAIR_AUGM
 
 Recommended command for using all frame pairs and appending reversed samples:
 ```shell
-python tools/train.py -f ./exp/Deep_TTC.py -d 1 -b 8 --fp16 use_all_frame_pairs true reverse_aug_append true reverse_aug_prob 1 reverse_ttc_mode sign
+python tools/train.py -f ./exp/Deep_TTC_Aug.py -d 1 -b 8 --fp16
 ```
 </details>
 

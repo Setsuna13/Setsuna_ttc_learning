@@ -6,9 +6,31 @@ import numpy as np
 import torch
 
 
-def get_crop_size(bbox, cur_bbox, scale_beta=0.1, expand_ratio=1.1, max_scale=1.26):
+def _is_valid_box(box):
+    box = np.asarray(box, dtype=np.float32)
+    return (
+        box.shape == (4,)
+        and np.isfinite(box).all()
+        and float(box[2] - box[0]) > 0
+        and float(box[3] - box[1]) > 0
+    )
+
+
+def get_crop_size(
+    bbox,
+    cur_bbox,
+    scale_beta=0.1,
+    expand_ratio=1.1,
+    max_scale=1.26,
+    allow_outside=False,
+):
     eps = 0.002
-    bbox, cur_bbox = expand_bbox_for_bg(bbox, cur_bbox, expand_ratio)
+    if not _is_valid_box(bbox) or not _is_valid_box(cur_bbox):
+        return None
+
+    bbox, cur_bbox = expand_bbox_for_bg(
+        bbox, cur_bbox, expand_ratio, allow_outside=allow_outside
+    )
 
     center_x = (bbox[2] + bbox[0]) / 2
     center_y = (bbox[3] + bbox[1]) / 2
@@ -22,22 +44,26 @@ def get_crop_size(bbox, cur_bbox, scale_beta=0.1, expand_ratio=1.1, max_scale=1.
     crop_h = scale_ratio * cur_bbox_h
     crop_w = scale_ratio * cur_bbox_w
 
-    if (center_x - crop_w / 2 > eps and center_x + crop_w / 2 + eps < 1 and
-            center_y - crop_h / 2 > eps and center_y + crop_h / 2 + eps < 1):
-        enlarge_bbox = [center_x - crop_w / 2, center_y - crop_h / 2, center_x + crop_w / 2, center_y + crop_h / 2]
-        enlarge_cur_bbox = [cur_center_x - crop_w / 2, cur_center_y - crop_h / 2, cur_center_x + crop_w / 2,
-                            cur_center_y + crop_h / 2]
+    enlarge_bbox = [center_x - crop_w / 2, center_y - crop_h / 2, center_x + crop_w / 2, center_y + crop_h / 2]
+    enlarge_cur_bbox = [cur_center_x - crop_w / 2, cur_center_y - crop_h / 2, cur_center_x + crop_w / 2,
+                        cur_center_y + crop_h / 2]
 
-        return enlarge_bbox, enlarge_cur_bbox, bbox, cur_bbox
-    else:
+    crop_inside = (
+        enlarge_bbox[0] > eps
+        and enlarge_bbox[2] + eps < 1
+        and enlarge_bbox[1] > eps
+        and enlarge_bbox[3] + eps < 1
+    )
+    if not allow_outside and not crop_inside:
         return None
+    return enlarge_bbox, enlarge_cur_bbox, bbox, cur_bbox
 
 
-def expand_bbox_for_bg(bbox, cur_bbox, ratio):
-    bbox_ratio = get_valid_ratio(bbox, ratio)
-    last_bbox_ratio = get_valid_ratio(cur_bbox, ratio)
-
-    ratio = min(bbox_ratio, last_bbox_ratio)
+def expand_bbox_for_bg(bbox, cur_bbox, ratio, allow_outside=False):
+    if not allow_outside:
+        bbox_ratio = get_valid_ratio(bbox, ratio)
+        last_bbox_ratio = get_valid_ratio(cur_bbox, ratio)
+        ratio = min(bbox_ratio, last_bbox_ratio)
     bbox = expand_box(bbox, ratio)
     cur_bbox = expand_box(cur_bbox, ratio)
     return bbox, cur_bbox
@@ -54,11 +80,13 @@ def get_valid_ratio(bbox, ratio):
     delta_x = (x2 - x1)
     delta_y = (y2 - y1)
 
+    if delta_x <= 0 or delta_y <= 0:
+        return 0.0
     max_ratio_x = min(ctr_x, 1 - ctr_x) / (delta_x / 2)
     max_ratio_y = min(ctr_y, 1 - ctr_y) / (delta_y / 2)
 
     max_ratio = min(max_ratio_x, max_ratio_y)
-    bg_ratio = min(ratio, max_ratio)
+    bg_ratio = max(0.0, min(ratio, max_ratio))
     return bg_ratio
 
 
@@ -87,6 +115,51 @@ def crop_bbox_img(img, bbox):
     return img[int(y1):int(y2), int(x1):int(x2)]
 
 
+def crop_bbox_img_with_padding(img, bbox, context=0, border_value=127):
+    """Crop a normalized box without clipping it, padding pixels outside the image."""
+    if not _is_valid_box(bbox):
+        raise ValueError("invalid crop box: {}".format(bbox))
+
+    height, width = img.shape[:2]
+    context = max(0, int(context or 0))
+    x1 = int(float(bbox[0]) * width)
+    y1 = int(float(bbox[1]) * height)
+    x2 = int(float(bbox[2]) * width)
+    y2 = int(float(bbox[3]) * height)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("crop box is smaller than one pixel: {}".format(bbox))
+
+    crop_x1, crop_y1 = x1 - context, y1 - context
+    crop_x2, crop_y2 = x2 + context, y2 + context
+    crop_width = crop_x2 - crop_x1
+    crop_height = crop_y2 - crop_y1
+
+    if img.ndim == 2:
+        output_shape = (crop_height, crop_width)
+    else:
+        output_shape = (crop_height, crop_width, img.shape[2])
+    cropped = np.empty(output_shape, dtype=img.dtype)
+    cropped[...] = border_value
+
+    src_x1, src_y1 = max(0, crop_x1), max(0, crop_y1)
+    src_x2, src_y2 = min(width, crop_x2), min(height, crop_y2)
+    if src_x2 > src_x1 and src_y2 > src_y1:
+        dst_x1, dst_y1 = src_x1 - crop_x1, src_y1 - crop_y1
+        dst_x2 = dst_x1 + (src_x2 - src_x1)
+        dst_y2 = dst_y1 + (src_y2 - src_y1)
+        cropped[dst_y1:dst_y2, dst_x1:dst_x2] = img[src_y1:src_y2, src_x1:src_x2]
+
+    # The collate function reconstructs the ROI as
+    # [left, top, crop_width - right, crop_height - bottom].
+    roi_margins = [
+        x1 - crop_x1,
+        y1 - crop_y1,
+        crop_x2 - x2,
+        crop_y2 - y2,
+    ]
+    return cropped, roi_margins
+
+
 def downsample_img(img, rate=0.5):
     _img = cv2.resize(
         img,
@@ -96,18 +169,36 @@ def downsample_img(img, rate=0.5):
     return _img
 
 
-def get_cropped_imgs(ref_img, tar_img, ref_box, tar_box, receptive_filed=32, max_unit_size=500):
+def get_cropped_imgs(
+    ref_img,
+    tar_img,
+    ref_box,
+    tar_box,
+    receptive_filed=32,
+    max_unit_size=500,
+    pad_if_needed=False,
+    border_value=127,
+):
     H, W = ref_img.shape[:2]
-    tar_padding = [min(int(tar_box[0] * W),receptive_filed),min(int(tar_box[1] * H),receptive_filed),
-                   min(int(W-tar_box[2] * W),receptive_filed),min(int(H-tar_box[3] * H),receptive_filed)]
-    ref_padding = [min(int(ref_box[0] * W), receptive_filed), min(int(ref_box[1] * H), receptive_filed),
-                   min(int(W - ref_box[2] * W), receptive_filed), min(int(H - ref_box[3] * H), receptive_filed)]
-    _ref_box = [int(ref_box[0] * W)-ref_padding[0], int(ref_box[1] * H)-ref_padding[1],
-                int(ref_box[2] * W)+ref_padding[2], int(ref_box[3] * H)+ref_padding[3]]
-    _tar_box = [int(tar_box[0] * W)-tar_padding[0], int(tar_box[1] * H)-tar_padding[1],
-                int(tar_box[2] * W)+tar_padding[2], int(tar_box[3] * H)+tar_padding[3]]
+    receptive_filed = max(0, int(receptive_filed or 0))
+    if pad_if_needed:
+        ref, ref_padding = crop_bbox_img_with_padding(
+            ref_img, ref_box, context=receptive_filed, border_value=border_value
+        )
+        tar, tar_padding = crop_bbox_img_with_padding(
+            tar_img, tar_box, context=receptive_filed, border_value=border_value
+        )
+    else:
+        tar_padding = [min(int(tar_box[0] * W),receptive_filed),min(int(tar_box[1] * H),receptive_filed),
+                       min(int(W-tar_box[2] * W),receptive_filed),min(int(H-tar_box[3] * H),receptive_filed)]
+        ref_padding = [min(int(ref_box[0] * W), receptive_filed), min(int(ref_box[1] * H), receptive_filed),
+                       min(int(W - ref_box[2] * W), receptive_filed), min(int(H - ref_box[3] * H), receptive_filed)]
+        _ref_box = [int(ref_box[0] * W)-ref_padding[0], int(ref_box[1] * H)-ref_padding[1],
+                    int(ref_box[2] * W)+ref_padding[2], int(ref_box[3] * H)+ref_padding[3]]
+        _tar_box = [int(tar_box[0] * W)-tar_padding[0], int(tar_box[1] * H)-tar_padding[1],
+                    int(tar_box[2] * W)+tar_padding[2], int(tar_box[3] * H)+tar_padding[3]]
 
-    ref, tar = crop_bbox_img(ref_img, _ref_box), crop_bbox_img(tar_img, _tar_box)
+        ref, tar = crop_bbox_img(ref_img, _ref_box), crop_bbox_img(tar_img, _tar_box)
 
     if max(ref.shape) > max_unit_size:
         ref = downsample_img(ref, )
@@ -201,4 +292,3 @@ def load_json(name):
 def save_json(filename, data):
     with open(filename, 'w') as f:
         json.dump(data, f)
-

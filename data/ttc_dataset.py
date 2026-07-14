@@ -18,6 +18,7 @@ from .dataset_api import TSTTC
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png", ".JPEG"]
 XML_EXT = [".xml"]
 PKL_EXT = [".pkl"]
+DEFAULT_FRAME_RATE = 10.0
 
 
 def load_pickle(f):
@@ -82,6 +83,9 @@ class TSTTCDataset(torchDataset):
             reverse_aug_prob=0.0,
             reverse_aug_append=False,
             reverse_ttc_mode="sign",
+            frame_rate=DEFAULT_FRAME_RATE,
+            pad_outside_crop=False,
+            crop_padding_value=127,
             use_robust_box_crop=False,
             robust_box_occ_thresh=0.3,
             robust_box_area_ratio_thresh=1.8,
@@ -102,7 +106,18 @@ class TSTTCDataset(torchDataset):
         self.frame_pair_sample_num = int(frame_pair_sample_num)
         self.reverse_aug_prob = float(reverse_aug_prob)
         self.reverse_aug_append = bool(reverse_aug_append)
-        self.reverse_ttc_mode = reverse_ttc_mode
+        self.reverse_ttc_mode = str(reverse_ttc_mode)
+        if self.reverse_ttc_mode not in {"sign", "reciprocal_scale"}:
+            raise ValueError(
+                "reverse_ttc_mode must be 'sign' or 'reciprocal_scale', got {}".format(
+                    self.reverse_ttc_mode
+                )
+            )
+        self.frame_rate = float(frame_rate)
+        if self.frame_rate <= 0:
+            raise ValueError("frame_rate must be positive, got {}".format(self.frame_rate))
+        self.pad_outside_crop = bool(pad_outside_crop)
+        self.crop_padding_value = crop_padding_value
         self.use_robust_box_crop = bool(use_robust_box_crop)
         self.robust_box_occ_thresh = float(robust_box_occ_thresh)
         self.robust_box_area_ratio_thresh = float(robust_box_area_ratio_thresh)
@@ -200,25 +215,40 @@ class TSTTCDataset(torchDataset):
 
     def _reverse_ttc(self, ttc, frame_gap):
         if self.reverse_ttc_mode == "reciprocal_scale":
-            fps = 10 / float(frame_gap)
+            fps = self.frame_rate / float(frame_gap)
             scale_ratio = ttc_to_scale_ratio(ttc, fps=fps)
-            reversed_scale_ratio = 1.0 / (scale_ratio + 1e-9)
+            reversed_scale_ratio = 1.0 / scale_ratio
             return scale_ratio_to_ttc(reversed_scale_ratio, fps=fps)
         return -ttc
+
+    def _forward_pair_scale(self, seq, cur_pos, frame_gap):
+        """Return the original ref->target scale label for one temporal pair."""
+        fps = self.frame_rate / float(frame_gap)
+        return float(ttc_to_scale_ratio(self._get_ttc(seq[cur_pos]), fps=fps))
 
     def _load_pair_annos(self, seq, ref_pos, cur_pos, reverse_pair):
         if ref_pos >= len(seq) or cur_pos >= len(seq):
             raise IndexError("frame pair ({}, {}) out of sequence length {}".format(ref_pos, cur_pos, len(seq)))
         frame_gap = abs(cur_pos - ref_pos)
+        forward_scale = self._forward_pair_scale(seq, cur_pos, frame_gap)
         if reverse_pair:
             objAnnoRef = copy.deepcopy(seq[cur_pos])
             objAnnoCur = copy.deepcopy(seq[ref_pos])
             original_ttc = self._get_ttc(seq[cur_pos])
-            self._set_ttc(objAnnoCur, self._reverse_ttc(original_ttc, frame_gap))
+            reversed_ttc = self._reverse_ttc(original_ttc, frame_gap)
+            self._set_ttc(objAnnoCur, reversed_ttc)
+            if self.reverse_ttc_mode == "reciprocal_scale":
+                # Pass this value directly to the head. Re-encoding it through TTC would
+                # introduce conversion epsilon and break the exact inverse relationship.
+                scale_gt = 1.0 / forward_scale
+            else:
+                fps = self.frame_rate / float(frame_gap)
+                scale_gt = float(ttc_to_scale_ratio(reversed_ttc, fps=fps))
         else:
             objAnnoRef = copy.deepcopy(seq[ref_pos])
             objAnnoCur = copy.deepcopy(seq[cur_pos])
-        return objAnnoRef, objAnnoCur, frame_gap
+            scale_gt = forward_scale
+        return objAnnoRef, objAnnoCur, frame_gap, scale_gt
 
     @staticmethod
     def _box_array(obj_anno):
@@ -328,7 +358,8 @@ class TSTTCDataset(torchDataset):
         return resized_img
     def pull_item(self, index):
         result_dict = {'imgPair':[],'refBoxAnnos':[],'curBoxAnnos':[],'ttc_imu':[],\
-                       'curAnnos':[],'dynamicRanges':[],'frame_gap':[],'masks':[]}
+                       'scale_gt':[],'curAnnos':[],'dynamicRanges':[],'frame_gap':[],
+                       'pair_indices':[],'is_reversed':[],'masks':[]}
         if self.first_last or not self.whole_img:
             cur_idx,ref_idx = -1,0
         else: # whole-image all-pair mode is not supported; keep the legacy first/last pair.
@@ -358,19 +389,32 @@ class TSTTCDataset(torchDataset):
                 max_scale = self.default_max_scale
                 seq = frameSeq[i][-self.seq_len:]
                 ref_box, cur_box = self._pair_boxes_for_crop(seq, 0, self.seq_len - 1, False, objAnnoRef, objAnnoCur)
-                candidate_boxes = get_crop_size(ref_box, cur_box,max_scale=max_scale,expand_ratio=self.expand_ratio)
+                candidate_boxes = get_crop_size(
+                    ref_box,
+                    cur_box,
+                    max_scale=max_scale,
+                    expand_ratio=self.expand_ratio,
+                    allow_outside=self.pad_outside_crop,
+                )
                 if candidate_boxes is not None:
                     result_dict['refBoxAnnos'].append(candidate_boxes[0])
                     result_dict['curBoxAnnos'].append(candidate_boxes[3])
                     result_dict['ttc_imu'].append(objAnnoCur['ttc_imu'])
+                    frame_gap = self.seq_len-ref_idx-1
+                    fps = self.frame_rate / float(frame_gap)
+                    result_dict['scale_gt'].append(float(ttc_to_scale_ratio(objAnnoCur['ttc_imu'], fps=fps)))
                     result_dict['curAnnos'].append(objAnnoCur)
-                    result_dict['frame_gap'].append(self.seq_len-ref_idx-1)
+                    result_dict['frame_gap'].append(frame_gap)
+                    result_dict['pair_indices'].append((0, self.seq_len - 1))
+                    result_dict['is_reversed'].append(False)
         else:
             result_dict['min_size_after_padding'] = self.min_size_after_padding
             anno_idx, ref_pos, cur_pos, reverse_pair = self._get_indexed_pair(int(index))
             try:
                 seq = self.annos[anno_idx][-self.seq_len:]
-                objAnnoRef, objAnnoCur, frame_gap = self._load_pair_annos(seq, ref_pos, cur_pos, reverse_pair)
+                objAnnoRef, objAnnoCur, frame_gap, scale_gt = self._load_pair_annos(
+                    seq, ref_pos, cur_pos, reverse_pair
+                )
             except IndexError:
                 logger.warning('fail to load image pair: %s' % index)
                 return result_dict
@@ -383,18 +427,31 @@ class TSTTCDataset(torchDataset):
 
             max_scale = self.default_max_scale
             ref_box, cur_box = self._pair_boxes_for_crop(seq, ref_pos, cur_pos, reverse_pair, objAnnoRef, objAnnoCur)
-            candidate_boxes = get_crop_size(ref_box, cur_box, max_scale=max_scale,
-                                            expand_ratio=self.expand_ratio)
+            candidate_boxes = get_crop_size(
+                ref_box,
+                cur_box,
+                max_scale=max_scale,
+                expand_ratio=self.expand_ratio,
+                allow_outside=self.pad_outside_crop,
+            )
             if candidate_boxes is not None:
                 result_dict['refBoxAnnos'].append(candidate_boxes[0])
                 result_dict['curBoxAnnos'].append(candidate_boxes[3])
                 result_dict['ttc_imu'].append(objAnnoCur['ttc_imu'])
+                result_dict['scale_gt'].append(scale_gt)
                 result_dict['curAnnos'].append(objAnnoCur)
                 result_dict['imgPair'], result_dict['ref_padding'], result_dict['cur_padding'] = get_cropped_imgs(imgRef, imgCur, result_dict['refBoxAnnos'][0],
                                                                 result_dict['curBoxAnnos'][0], self.receptive_filed,
                                                                 max_unit_size=self.box_downsample_thresh,
+                                                                pad_if_needed=self.pad_outside_crop,
+                                                                border_value=self.crop_padding_value,
                                                                 )
                 result_dict['frame_gap'].append(frame_gap)
+                if reverse_pair:
+                    result_dict['pair_indices'].append((cur_pos, ref_pos))
+                else:
+                    result_dict['pair_indices'].append((ref_pos, cur_pos))
+                result_dict['is_reversed'].append(reverse_pair)
 
             else:
                 logger.warning('box out of img after enlarging: %s' % objAnnoCur['img_path'])
@@ -692,13 +749,25 @@ class InfiniteSampler(Sampler):
 
 def ttc_collate_fn(batch):
     cur_valid_idx = 0
-    imgs, boxes, ttcs,padding_sizes,dictAnnos = [], [], [],[],{'metaAnnos':[],'dynamicRanges':[],'frame_gap':[],'masks':[]}
+    imgs, boxes, ttcs, padding_sizes = [], [], [], []
+    dictAnnos = {
+        'metaAnnos': [],
+        'dynamicRanges': [],
+        'frame_gap': [],
+        'scale_gt': [],
+        'pair_indices': [],
+        'is_reversed': [],
+        'masks': []
+    }
     for sample in batch:
         if len(sample['refBoxAnnos']):
             imgs.extend(sample['imgPair'])
             ttcs.extend(sample['ttc_imu'])
             dictAnnos['metaAnnos'].extend(sample['curAnnos'])
             dictAnnos['frame_gap'].extend(sample['frame_gap'])
+            dictAnnos['scale_gt'].extend(sample.get('scale_gt', []))
+            dictAnnos['pair_indices'].extend(sample.get('pair_indices', []))
+            dictAnnos['is_reversed'].extend(sample.get('is_reversed', []))
             if 'dynamicRanges' in sample:
                 dictAnnos['dynamicRanges'].extend(sample['dynamicRanges'])
             if 'masks' in sample:

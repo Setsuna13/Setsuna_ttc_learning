@@ -126,6 +126,10 @@ class Exp(BaseExp):
         self.box_downsample_thresh = 300  # [300,300]
         # padding img size when cropping
         self.receptive_filed = 32
+        # Keep out-of-image training ROIs by padding them instead of dropping the pair.
+        # Disabled in the baseline experiment for backward-compatible reproduction.
+        self.pad_outside_crop = False
+        self.crop_padding_value = 127
         # use NeRF data or not
         self.use_nerf = False
         # use resample for ttc 0~6 same lane or not
@@ -443,6 +447,8 @@ class Exp(BaseExp):
                 'reverse_aug_prob': self.reverse_aug_prob,
                 'reverse_aug_append': self.reverse_aug_append,
                 'reverse_ttc_mode': self.reverse_ttc_mode,
+                'pad_outside_crop': self.pad_outside_crop,
+                'crop_padding_value': self.crop_padding_value,
                 'use_robust_box_crop': self.use_robust_box_crop,
                 'robust_box_occ_thresh': self.robust_box_occ_thresh,
                 'robust_box_area_ratio_thresh': self.robust_box_area_ratio_thresh,

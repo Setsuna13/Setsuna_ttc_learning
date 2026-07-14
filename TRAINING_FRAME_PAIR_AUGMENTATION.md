@@ -10,7 +10,7 @@ The original training path uses only the first and last frame in a 6-frame seque
 frame 0 -> frame 5
 ```
 
-The new augmentation can use all two-frame pairs from the same 6-frame sequence and can also append the time-reversed pair with a flipped TTC label.
+The augmentation uses all two-frame pairs from the same 6-frame sequence and appends the swapped direction with an exactly reciprocal scale label.
 
 ## Frame Pairs
 
@@ -38,36 +38,57 @@ When reverse pairs are appended with probability 1, the training set contains bo
 
 ## Reverse Label Rule
 
-For a forward sample:
+Let `g` be the frame gap, `f = 10 / g` the pair-specific FPS, and `T` the TTC annotation at the forward target frame. The original scale label is:
 
 ```text
-ref = early frame
-cur = late frame
-TTC = -6
+s_forward = TTC_to_scale(T, f)
 ```
 
-The appended reverse sample becomes:
+After swapping the images and boxes:
 
 ```text
-ref = late frame
-cur = early frame
-TTC = +6
+s_reverse = 1 / s_forward
 ```
 
-The image pair and boxes are swapped, `frame_gap` stays the same, and the head converts TTC to scale with `fps = 10 / frame_gap`.
+The dataset passes `scale_gt` directly to the head, so `s_forward * s_reverse == 1` before any loss-range clamping. A compatible reverse TTC value is also back-computed for TTC-aware auxiliary losses and logging. Merely changing the sign of TTC is not generally equivalent to scale inversion.
 
 ## Label Modes
 
 | Mode | TTC behavior | Scale behavior | Recommended use |
 | --- | --- | --- | --- |
-| `sign` | `-6 -> +6` | Recomputed from flipped TTC | Main training; preserves TTC sign semantics |
-| `reciprocal_scale` | TTC is back-computed | Scale is exactly `1 / original_scale` | Ablation for strict scale inversion |
+| `reciprocal_scale` | TTC is back-computed | Scale is exactly `1 / original_scale` | Bidirectional training |
+| `sign` | `T -> -T` | Recomputed from sign-flipped TTC | Legacy ablation only |
 
-Use `sign` first. Use `reciprocal_scale` only when the experiment specifically requires exact reciprocal scale labels.
+`exp/Deep_TTC_Aug.py` selects `reciprocal_scale` and expands the scale-bin interval so it is closed under inversion.
 
 ## Recommended Command
 
-Use all 6-frame pairs and keep both original and reversed samples:
+Use all 6-frame pairs and keep both directions:
+
+```shell
+python tools/train.py \
+  -f ./exp/Deep_TTC_Aug.py \
+  -d 1 \
+  -b 8 \
+  --fp16
+```
+
+This produces 30 indexed training samples per original 6-frame sequence: 15 temporal pairs times 2 directions. Validation remains unchanged.
+
+## Boundary Crop Retention
+
+`Deep_TTC_Aug.py` enables `pad_outside_crop=true`. When an enlarged ROI crosses an image boundary, the loader now:
+
+1. keeps the requested ROI geometry unchanged;
+2. copies the visible pixels into a larger canvas;
+3. fills only the out-of-image region with value `127`;
+4. shifts the ROI coordinates into that padded canvas.
+
+This replaces the legacy `return None` behavior and avoids NumPy negative-index wraparound. The baseline `Deep_TTC.py` keeps padding disabled for reproduction compatibility.
+
+On a smoke test using 20 real training annotation files (1,505 sequences and 45,150 bidirectional frame-pair samples), the legacy boundary rule rejected 194 samples. Padding retained all 45,150 geometrically valid samples. Corrupt images and non-finite or zero-area annotation boxes are still rejected because they do not contain usable training evidence.
+
+The same behavior can be enabled on the baseline experiment through overrides:
 
 ```shell
 python tools/train.py \
@@ -78,10 +99,10 @@ python tools/train.py \
   use_all_frame_pairs true \
   reverse_aug_append true \
   reverse_aug_prob 1 \
-  reverse_ttc_mode sign
+  reverse_ttc_mode reciprocal_scale
 ```
 
-This trains on the original forward samples and the appended reversed samples.
+Prefer `Deep_TTC_Aug.py`, because it also expands the configured scale interval to cover reciprocal labels without clipping.
 
 ## Fixed-Size Alternative
 
@@ -96,7 +117,7 @@ python tools/train.py \
   use_all_frame_pairs true \
   reverse_aug_append false \
   reverse_aug_prob 0.5 \
-  reverse_ttc_mode sign
+  reverse_ttc_mode reciprocal_scale
 ```
 
 ## Optional Pair Sampling
@@ -113,7 +134,7 @@ If `reverse_aug_append true reverse_aug_prob 1` is also used, those 5 forward pa
 
 ## Validation
 
-Validation remains fixed to the first-last pair. The current evaluator converts predicted scale to TTC with a fixed `fps = 10 / (sequence_len - 1)`, so mixing validation pairs with different frame gaps would make the reported TTC metric inconsistent.
+Validation remains fixed to the first-last pair, preserving direct comparability with the original protocol and avoiding duplicate annotation IDs in evaluation output.
 
 ## Relevant Configs
 
@@ -125,4 +146,8 @@ frame_pair_sample_num
 reverse_aug_prob
 reverse_aug_append
 reverse_ttc_mode
+pad_outside_crop
+crop_padding_value
 ```
+
+Each batch also carries `frame_gap`, `scale_gt`, `pair_indices`, and `is_reversed`. The head prefers the explicit `scale_gt`; older datasets without that field retain the original TTC-to-scale fallback.
